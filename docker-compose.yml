@@ -1,0 +1,37 @@
+services:
+  # docker compose --profile dev up
+  dev:
+    profiles: [dev]
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "3000:3000"
+    volumes:
+      - .:/app
+      # Keep the image's node_modules; the host tree is Windows-built.
+      - /app/node_modules
+      - /app/.nuxt
+      - /app/.output
+    environment:
+      # Bind-mounted source on Windows doesn't emit inotify events.
+      CHOKIDAR_USEPOLLING: "true"
+      WATCHPACK_POLLING: "true"
+      NUXT_PUBLIC_URL_BASE: http://localhost:3000
+    tty: true
+
+  # docker compose up  (default profile)
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NUXT_PUBLIC_URL_BASE: ${NUXT_PUBLIC_URL_BASE:-https://u34ss-explorer.gimme.pet}
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

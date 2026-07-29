@@ -1,0 +1,6 @@
+node_modules/
+dump/
+dist/
+*.env 
+.nuxt/
+.output/

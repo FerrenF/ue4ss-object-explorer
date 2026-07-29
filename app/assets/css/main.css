@@ -1,0 +1,121 @@
+/*
+  Visual thesis: this is a hex editor that happens to understand UObjects.
+  Colour is data, never decoration — every hue in the table encodes the type
+  category of the row, so 400k rows stay scannable at a glance. The one
+  ornamental liberty is the address gutter, which ghosts the hex digits every
+  object in the dump shares and lights only the ones that differ.
+*/
+
+:root {
+  --void: #0f1319;
+  --panel: #161c25;
+  --raise: #1d2531;
+  --rule: #263041;
+  --rule-soft: #1c2432;
+  --ink: #c6d0dc;
+  --ink-strong: #eef3f8;
+  --dim: #6b7a8d;
+  --dimmer: #3d4859;
+  --amber: #e8a33d;
+  --amber-soft: #4a3413;
+
+  /* type-category hues */
+  --t-container: #7fa9ff;
+  --t-callable: #c08cff;
+  --t-numeric: #58c99a;
+  --t-reference: #e8a33d;
+  --t-bool: #ff8fa9;
+  --t-text: #63cfdf;
+  --t-other: #8493a5;
+
+  --mono: 'Fira Sans', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --ui: 'Archivo', system-ui, -apple-system, sans-serif;
+
+  --row-h: 26px;
+  --gutter-w: 128px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#__nuxt {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--void);
+  color: var(--ink);
+  font-family: var(--ui);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Micro-labels. Every section header in the app is one of these: uppercase,
+   heavily tracked, small. They read as register markings on an instrument. */
+.eyebrow {
+  font-family: var(--ui);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+.mono {
+  font-family: var(--mono);
+  font-variant-ligatures: none;
+}
+
+button {
+  font-family: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+input {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-strong);
+  background: var(--void);
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  padding: 6px 9px;
+  width: 100%;
+}
+
+input::placeholder {
+  color: var(--dimmer);
+}
+
+input:focus-visible,
+button:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 1px;
+}
+
+::-webkit-scrollbar {
+  width: 11px;
+  height: 11px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--rule);
+  border: 3px solid var(--void);
+  border-radius: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -1,0 +1,13 @@
+node_modules
+.nuxt
+.output
+dist
+.git
+.gitignore
+*.env
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# The raw 60 MB dump is only an input to `npm run prebake`, never to the build.
+dump/
