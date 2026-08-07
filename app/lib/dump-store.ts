@@ -4,12 +4,15 @@ const COLON = 0x3a
 const DOT = 0x2e
 const SLASH = 0x2f
 
+/** `natural` is dump order — the order the lines appeared in the file. */
+export type SortKey = 'natural' | 'path' | 'address' | 'offset' | 'name' | 'type'
+
 export interface Query {
   typeIds?: number[] // Type ids to keep. Empty/undefined = all types.
   pathPrefix?: string // Exact prefix on the object path, e.g. "/Script/Engine".
   nameContains?: string //  Case-insensitive substring on the leaf name. 
   pathContains?: string //  Case-insensitive substring on the whole path. 
-  sort?: 'path' | 'address' | 'offset' | 'natural'
+  sort?: SortKey
   descending?: boolean
 }
 
@@ -171,9 +174,11 @@ export class DumpStore {
     const { addr, offset } = this.cols
 
     let cmp: (a: number, b: number) => number
-    if (mode === 'address') cmp = (a, b) => addr[a]! - addr[b]!
-    else if (mode === 'offset') cmp = (a, b) => offset[a]! - offset[b]!
+    if (mode === 'address') cmp = (a, b) => addr[a]! - addr[b]! || a - b
+    else if (mode === 'offset') cmp = (a, b) => offset[a]! - offset[b]! || a - b
     else if (mode === 'path') cmp = (a, b) => this.cmpPath(a, b)
+    else if (mode === 'name') cmp = (a, b) => this.cmpName(a, b) || this.cmpPath(a, b)
+    else if (mode === 'type') cmp = (a, b) => this.cmpType(a, b) || this.cmpPath(a, b)
     else cmp = (a, b) => a - b
 
     const sorted = rows.slice().sort(cmp)
@@ -193,6 +198,44 @@ export class DumpStore {
       if (d) return d
     }
     return ae - i - (be - j)
+  }
+
+  /**
+   * Case-folded byte order over the leaf name. Folding matters here in a way
+   * it does not for `cmpPath`: names are the column people read, and raw byte
+   * order files every lowercase name after every uppercase one.
+   */
+  private cmpName(a: number, b: number): number {
+    const { pathStart, pathBlob, nameOff } = this.cols
+    let i = pathStart[a]! + nameOff[a]!
+    let j = pathStart[b]! + nameOff[b]!
+    const ae = pathStart[a + 1]!
+    const be = pathStart[b + 1]!
+    while (i < ae && j < be) {
+      const d = fold(pathBlob[i++]!) - fold(pathBlob[j++]!)
+      if (d) return d
+    }
+    return ae - i - (be - j)
+  }
+
+  /**
+   * Type ids are assigned in first-seen order, so they say nothing about
+   * alphabetical order. Rank them once — there are a few hundred types
+   * against up to a million rows, so this turns every row comparison into
+   * one array lookup.
+   */
+  private typeRank: Int32Array | null = null
+  private cmpType(a: number, b: number): number {
+    if (!this.typeRank) {
+      const { types } = this.cols
+      const order = types.map((_, i) => i)
+      order.sort((x, y) => types[x]!.localeCompare(types[y]!))
+      const rank = new Int32Array(types.length)
+      order.forEach((id, r) => (rank[id] = r))
+      this.typeRank = rank
+    }
+    const { typeId } = this.cols
+    return this.typeRank[typeId[a]!]! - this.typeRank[typeId[b]!]!
   }
 
   // tree

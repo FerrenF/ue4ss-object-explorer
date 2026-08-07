@@ -59,30 +59,43 @@ function call<T = any>(op: string, payload: Record<string, unknown> = {}, transf
 }
 
 export function useDump() {
-  async function loadFile(file: File) {
+  /**
+   * @param buffer is transferred, not copied: a 60 MB structured clone is a
+   * visible stall. The caller must not touch it afterwards.
+   */
+  async function loadBuffer(
+    buffer: ArrayBuffer,
+    name: string,
+    opts: { format?: 'text' | 'pdx'; source?: string } = {},
+  ): Promise<boolean> {
     loading.value = true
     error.value = ''
     progress.value = 0
     try {
-      const buffer = await file.arrayBuffer()
-      // Transferred, not copied: a 60 MB structured clone is a visible stall.
-      const r = await call('parse', { buffer, name: file.name }, [buffer])
-      applyMeta(r)
+      applyMeta(await call('parse', { buffer, name, ...opts }, [buffer]))
+      return true
     } catch (e) {
       error.value = (e as Error).message
+      return false
     } finally {
       loading.value = false
       progress.value = 0
     }
   }
 
-  async function restore(key: string) {
+  const loadFile = async (file: File) => loadBuffer(await file.arrayBuffer(), file.name)
+
+  /** Resolves false when the key is not in the cache, which the URL restore
+   *  path treats as "link received without the dump" rather than an error. */
+  async function restore(key: string): Promise<boolean> {
     loading.value = true
     error.value = ''
     try {
       applyMeta(await call('restore', { key }))
+      return true
     } catch (e) {
       error.value = (e as Error).message
+      return false
     } finally {
       loading.value = false
     }
@@ -140,6 +153,7 @@ export function useDump() {
 
   return {
     loadFile,
+    loadBuffer,
     restore,
     reset,
     runQuery,

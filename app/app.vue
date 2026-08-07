@@ -1,29 +1,95 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue'
 import { useDump, type RowView } from './composables/useDump'
+import { useFrames } from './composables/useFrames'
 import { hue, abbreviate } from './lib/type-hue'
 import { listDumps, dropDump, type CachedDump } from './lib/persist'
+import { listHosted, download, fileNameOf, type HostedDump } from './lib/hosted'
+import { encodeView, decodeView, emptyView, type ViewState } from './lib/view-state'
+import type { SortKey } from './lib/dump-store'
 import HeaderBar from '@/components/HeaderBar.vue'
 const d = useDump()
+const frames = useFrames()
 
 const nameQuery = ref('')
 const pathQuery = ref('')
 const pathPrefix = ref('')
 const activeTypes = ref<number[]>([])
-const sort = ref<'natural' | 'path' | 'address' | 'offset'>('natural')
+const sort = ref<SortKey>('natural')
+const descending = ref(false)
 const inspected = ref<RowView | null>(null)
 const outerOf = ref<RowView | null>(null)
 const cached = ref<CachedDump[]>([])
+const hosted = ref<HostedDump[]>([])
 const showAllTypes = ref(false)
 const dragging = ref(false)
 const treeVersion = ref(0)
 
+/**
+ * Filters carried in from a link, held until the dump they belong to is up.
+ *
+ * The hash is kept alongside them so that a recipient who did not have the
+ * dump, and then loads the file by hand, still lands on the sender's view —
+ * while someone who opens an unrelated dump instead does not inherit filters
+ * meant for a different one.
+ */
+const pending = ref<{ hash: string; view: ViewState } | null>(null)
+
 const fmt = new Intl.NumberFormat()
+
+// ------------------------------------------------------------------ the view
+
+/**
+ * Type filters travel as names, not as the ids the store indexes by, so both
+ * directions have to go through the dump's type table. A name the current
+ * dump does not have simply drops out — a link from a newer dump should lose
+ * the filter it cannot express, not fail to open.
+ */
+function currentView(): ViewState {
+  return {
+    prefix: pathPrefix.value,
+    name: nameQuery.value.trim(),
+    path: pathQuery.value.trim(),
+    sort: sort.value,
+    desc: descending.value,
+    types: activeTypes.value
+      .map((id) => d.types.value[id])
+      .filter((n): n is string => !!n)
+      .sort(),
+  }
+}
+
+function applyView(v: ViewState) {
+  pathPrefix.value = v.prefix
+  nameQuery.value = v.name
+  pathQuery.value = v.path
+  sort.value = v.sort
+  descending.value = v.desc
+  activeTypes.value = v.types.map((n) => d.types.value.indexOf(n)).filter((i) => i >= 0)
+}
+
+function syncUrl(v: ViewState) {
+  history.replaceState(null, '', encodeView(d.dumpKey.value, v))
+}
 
 let timer: ReturnType<typeof setTimeout>
 function schedule() {
   clearTimeout(timer)
-  timer = setTimeout(run, 120)
+  timer = setTimeout(commit, 120)
+}
+
+/**
+ * The one path by which a filter change becomes a frame, a URL and a query.
+ *
+ * Replaying a frame runs through here too, and needs no guard against
+ * recording itself: after `applyView` the refs are *equal* to the frame at
+ * the cursor, and `push` drops a frame identical to the current one.
+ */
+function commit() {
+  const v = currentView()
+  frames.push(v)
+  syncUrl(v)
+  run()
 }
 
 async function run() {
@@ -34,18 +100,60 @@ async function run() {
     nameContains: nameQuery.value.trim() || undefined,
     pathContains: pathQuery.value.trim() || undefined,
     sort: sort.value,
+    descending: descending.value,
   })
 }
 
 watch([nameQuery, pathQuery], schedule)
-watch([pathPrefix, activeTypes, sort], run, { deep: true })
-watch(d.count, () => {
-  treeVersion.value++
-  pathPrefix.value = ''
-  activeTypes.value = []
+watch([pathPrefix, activeTypes, sort, descending], commit, { deep: true })
+
+/** A new dump invalidates every frame: the paths and types are a different
+ *  vocabulary, so the queue restarts rather than carrying over. */
+function resetTo(v: ViewState) {
+  applyView(v)
   inspected.value = null
+  outerOf.value = null
+  showAllTypes.value = false
+  treeVersion.value++
+  frames.reset(currentView())
+  syncUrl(frames.current.value)
   run()
+}
+
+watch(d.count, () => {
+  const p = pending.value
+  const claimed = !!p && p.hash === d.dumpKey.value
+  resetTo(claimed ? p!.view : emptyView())
+  if (claimed) {
+    pending.value = null
+    linkMiss.value = false
+  }
+  refreshCached()
 })
+
+function setSort(key: SortKey, desc: boolean) {
+  sort.value = key
+  descending.value = desc
+}
+
+function step(delta: -1 | 1) {
+  const f = delta < 0 ? frames.back() : frames.forward()
+  if (!f) return
+  applyView(f)
+  syncUrl(f)
+  run()
+}
+
+const copied = ref(false)
+async function copyLink() {
+  try {
+    await navigator.clipboard.writeText(location.href)
+    copied.value = true
+    setTimeout(() => (copied.value = false), 1400)
+  } catch {
+    /* clipboard blocked; the URL bar already shows the link */
+  }
+}
 
 function toggleType(id: number) {
   const i = activeTypes.value.indexOf(id)
@@ -96,22 +204,75 @@ async function forget(key: string) {
   refreshCached()
 }
 
+// ---------------------------------------------------------------- site dumps
+
+const grabbing = ref('')
+const grabPct = ref<number | null>(0)
+const grabError = ref('')
+
+/** Only dumps this browser has not already taken. The cached copy records the
+ *  manifest id it came from, which is what makes "already have it" answerable
+ *  without re-hashing a 37 MB file. */
+const offered = computed(() => {
+  const have = new Set(cached.value.map((c) => c.source).filter(Boolean))
+  return hosted.value.filter((h) => !have.has(h.id))
+})
+
+/**
+ * Download on demand, never on load. One interaction fetches, caches, and
+ * opens the dump, so the offer disappearing from this list is the same
+ * gesture that puts it on screen.
+ */
+async function grab(h: HostedDump) {
+  grabbing.value = h.id
+  grabError.value = ''
+  grabPct.value = 0
+  try {
+    const buffer = await download(h, (f) => (grabPct.value = f))
+    await d.loadBuffer(buffer, fileNameOf(h), { format: h.format ?? 'text', source: h.id })
+    await refreshCached()
+  } catch (e) {
+    grabError.value = (e as Error).message
+  } finally {
+    grabbing.value = ''
+    grabPct.value = 0
+  }
+}
+
 /** Unload the dump and drop back to the intro screen. The parsed copy stays
  *  in IndexedDB, so it reappears under "Already parsed". */
 async function clearDump() {
+  // The d.count watcher runs resetTo(), which clears every filter, the frame
+  // queue and the URL. Only the things outside that surface are left here.
   await d.reset()
-  // The d.count watcher clears pathPrefix / activeTypes / inspected; the rest
-  // of the query surface is ours.
-  nameQuery.value = ''
-  pathQuery.value = ''
-  sort.value = 'natural'
-  showAllTypes.value = false
-  outerOf.value = null
   dragging.value = false
 }
 
-onMounted(refreshCached)
-watch(d.count, refreshCached)
+/**
+ * A link carries a dump hash and a set of filters, but never the dump — 37 MB
+ * does not fit in a URL. The recipient either already has that dump in
+ * IndexedDB, in which case it opens with the sender's filters intact, or they
+ * do not, and they land on the normal intro with a note saying so.
+ */
+const linkMiss = ref(false)
+
+onMounted(async () => {
+  await refreshCached()
+  listHosted()
+    .then((h) => (hosted.value = h))
+    .catch(() => {})
+
+  const { dump, view } = decodeView(location.search)
+  if (!dump) return
+  pending.value = { hash: dump, view }
+  if (!(await d.restore(dump))) {
+    linkMiss.value = true
+    // Not surfaced as an error: a link arriving without its dump is the
+    // expected case, and `linkMiss` says so in plainer terms. The pending
+    // view stays put so that loading the file by hand still lands on it.
+    d.error.value = ''
+  }
+})
 
 const tail = (s: string, max = 72) =>
   s.length <= max ? s : '…' + s.slice(s.length - max + 1)
@@ -161,6 +322,34 @@ const mb = (n: number) => (n / 1e6).toFixed(1) + ' MB'
         </label>
 
         <p v-if="d.error.value" class="err mono">{{ d.error.value }}</p>
+        <p v-if="linkMiss" class="err mono">
+          That link points at a dump this browser has not loaded yet. Open the same
+          file below or drop it above, and the link will work from then on.
+        </p>
+
+        <div v-if="offered.length" class="cached">
+          <p class="eyebrow">Available from this site</p>
+          <div v-for="h in offered" :key="h.id" class="cache-row mono">
+            <span class="cache-name">{{ h.title }}</span>
+            <span class="cache-meta">
+              <template v-if="h.bytes">{{ mb(h.bytes) }}</template>
+              <template v-if="h.note"> · {{ h.note }}</template>
+            </span>
+            <button
+              class="get"
+              :disabled="!!grabbing"
+              @click="grab(h)"
+            >
+              <template v-if="grabbing !== h.id">download</template>
+              <template v-else-if="grabPct === null">downloading…</template>
+              <template v-else>{{ Math.round(grabPct * 100) }}%</template>
+            </button>
+          </div>
+          <div v-if="grabbing" class="meter thin">
+            <i :style="{ width: (grabPct ?? 0) * 100 + '%' }" />
+          </div>
+          <p v-if="grabError" class="err mono">{{ grabError }}</p>
+        </div>
 
         <div v-if="cached.length" class="cached">
           <p class="eyebrow">Already parsed</p>
@@ -184,14 +373,36 @@ const mb = (n: number) => (n / 1e6).toFixed(1) + ' MB'
       <section class="main">
         <div class="controls">
           <div class="searches">
+            <!-- Filter history. Every change to the query surface lands here as
+                 a frame, so stepping back is stepping back through views. -->
+            <div class="frames mono">
+              <button
+                :disabled="!frames.canBack.value"
+                title="Previous view"
+                aria-label="Previous view"
+                @click="step(-1)"
+              >
+                ‹
+              </button>
+              <span class="tally" :title="`Frame ${frames.index.value + 1} of ${frames.frames.value.length}`">
+                {{ frames.index.value + 1 }}/{{ frames.frames.value.length }}
+              </span>
+              <button
+                :disabled="!frames.canForward.value"
+                title="Next view"
+                aria-label="Next view"
+                @click="step(1)"
+              >
+                ›
+              </button>
+            </div>
+
             <input v-model="nameQuery" placeholder="search name…" spellcheck="false" />
             <input v-model="pathQuery" placeholder="search full path…" spellcheck="false" />
-            <select v-model="sort" class="mono">
-              <option value="natural">dump order</option>
-              <option value="path">path</option>
-              <option value="address">address</option>
-              <option value="offset">field offset</option>
-            </select>
+
+            <button class="share mono" title="Copy a link to this exact view" @click="copyLink">
+              {{ copied ? 'copied' : 'link' }}
+            </button>
           </div>
 
           <div v-if="pathPrefix" class="crumb mono">
@@ -226,8 +437,11 @@ const mb = (n: number) => (n / 1e6).toFixed(1) + ' MB'
         <ObjectTable
           :total="d.total.value"
           :shared-digits="d.sharedAddressDigits.value"
+          :sort="sort"
+          :descending="descending"
           :fetch-window="d.fetchWindow"
           @inspect="inspect"
+          @sort="setSort"
         />
 
         <footer class="status mono">
@@ -375,6 +589,32 @@ const mb = (n: number) => (n / 1e6).toFixed(1) + ' MB'
   color: var(--t-bool);
 }
 
+.get {
+  flex: none;
+  font-family: inherit;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--amber);
+  background: none;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  padding: 4px 9px;
+  cursor: pointer;
+}
+.get:hover:not(:disabled) {
+  border-color: var(--amber);
+}
+.get:disabled {
+  color: var(--dimmer);
+  cursor: default;
+}
+
+.meter.thin {
+  width: 100%;
+  margin-top: 8px;
+}
+
 /* explorer */
 .body {
   flex: 1;
@@ -402,18 +642,64 @@ const mb = (n: number) => (n / 1e6).toFixed(1) + ' MB'
 .searches {
   display: flex;
   gap: 8px;
+  align-items: stretch;
 }
 .searches input {
   flex: 1;
+  min-width: 0;
 }
-.searches select {
+
+.frames {
+  display: flex;
+  align-items: center;
   flex: none;
-  font-size: 11px;
-  color: var(--ink);
-  background: var(--void);
   border: 1px solid var(--rule);
   border-radius: 3px;
-  padding: 0 8px;
+  overflow: hidden;
+}
+.frames button {
+  width: 22px;
+  align-self: stretch;
+  font-size: 15px;
+  line-height: 1;
+  color: var(--amber);
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+.frames button:disabled {
+  color: var(--dimmer);
+  cursor: default;
+}
+.frames button:not(:disabled):hover {
+  background: var(--raise);
+}
+.tally {
+  font-size: 10px;
+  color: var(--dim);
+  padding: 0 6px;
+  border-left: 1px solid var(--rule);
+  border-right: 1px solid var(--rule);
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+}
+
+.share {
+  flex: none;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+  background: none;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  padding: 0 10px;
+  cursor: pointer;
+}
+.share:hover {
+  color: var(--amber);
+  border-color: var(--amber);
 }
 
 .crumb {

@@ -1,15 +1,52 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue'
 import type { RowView } from '../composables/useDump'
+import type { SortKey } from '../lib/dump-store'
 import { hue, abbreviate } from '../lib/type-hue'
 
 const props = defineProps<{
   total: number
   sharedDigits: number
+  sort: SortKey
+  descending: boolean
   fetchWindow: (start: number, end: number) => Promise<{ start: number; rows: RowView[] }>
 }>()
 
-const emit = defineEmits<{ (e: 'inspect', row: RowView): void }>()
+const emit = defineEmits<{
+  (e: 'inspect', row: RowView): void
+  (e: 'sort', key: SortKey, descending: boolean): void
+}>()
+
+/**
+ * Sorting is free here, and that is not obvious given the table streams its
+ * rows in windows.
+ *
+ * The windowing is over an index array the worker already holds — `query`
+ * produces a Uint32Array of matching row numbers, sorts it, and the UI asks
+ * for slices of it by position. Order is therefore decided before any chunk
+ * is handed out, not assembled across chunks, so a re-sort is one comparator
+ * pass in the worker (a few hundred ms at ~800k rows, the same cost the
+ * existing path sort already pays) followed by the scroll reset that a new
+ * query does anyway. Nothing has to be re-fetched or merged.
+ */
+const COLUMNS: { key: SortKey; label: string; cls: string }[] = [
+  { key: 'address', label: 'ADDRESS', cls: 'col-addr' },
+  { key: 'type', label: 'TYPE', cls: 'col-type' },
+  { key: 'name', label: 'NAME', cls: 'col-name' },
+  { key: 'path', label: 'CONTAINER', cls: 'col-path' },
+  { key: 'offset', label: 'OFF', cls: 'col-off' },
+]
+
+/** asc → desc → off. The third click restores dump order, which is a view
+ *  people want back and would otherwise have no control for. */
+function cycle(key: SortKey) {
+  if (props.sort !== key) emit('sort', key, false)
+  else if (!props.descending) emit('sort', key, true)
+  else emit('sort', 'natural', false)
+}
+
+const arrow = (key: SortKey) =>
+  props.sort !== key ? '' : props.descending ? '↓' : '↑'
 
 const ROW_H = 26
 const OVERSCAN = 24
@@ -88,11 +125,24 @@ function tail(s: string, max = 64) {
 <template>
   <div class="table">
     <header class="head mono">
-      <span class="col-addr">ADDRESS</span>
-      <span class="col-type">TYPE</span>
-      <span class="col-name">NAME</span>
-      <span class="col-path">CONTAINER</span>
-      <span class="col-off">OFF</span>
+      <button
+        v-for="c in COLUMNS"
+        :key="c.key"
+        type="button"
+        class="sorter"
+        :class="[c.cls, { on: sort === c.key }]"
+        :title="
+          sort === c.key && descending
+            ? 'Sorted descending — click for dump order'
+            : sort === c.key
+              ? 'Sorted ascending — click for descending'
+              : `Sort by ${c.label.toLowerCase()}`
+        "
+        :aria-sort="sort === c.key ? (descending ? 'descending' : 'ascending') : 'none'"
+        @click="cycle(c.key)"
+      >
+        {{ c.label }}<i class="arrow">{{ arrow(c.key) }}</i>
+      </button>
     </header>
 
     <div ref="viewport" class="viewport" @scroll.passive="onScroll" tabindex="0">
@@ -155,6 +205,37 @@ function tail(s: string, max = 64) {
   background: var(--panel);
   border-bottom: 1px solid var(--rule);
   flex: none;
+}
+
+/* Headers are buttons but must keep the exact column geometry of the rows
+   below them, so they take the same .col-* classes and add nothing but the
+   affordance. */
+.head .sorter {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 100%;
+  padding: 0;
+  font: inherit;
+  letter-spacing: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.head .sorter:hover {
+  color: var(--ink);
+}
+.head .sorter.on {
+  color: var(--amber);
+}
+.head .sorter.col-off {
+  justify-content: flex-end;
+}
+.arrow {
+  font-style: normal;
+  font-size: 9px;
 }
 
 .viewport {

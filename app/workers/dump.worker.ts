@@ -1,7 +1,8 @@
 /// <reference lib="webworker" />
 import { parseDump } from '../lib/dump-parse'
+import { decodeBundle } from '../lib/bundle'
 import { DumpStore, type Query } from '../lib/dump-store'
-import { fingerprint, saveDump, loadDump } from '../lib/persist'
+import { contentHash, titleFor, saveDump, loadDump } from '../lib/persist'
 
 /**
  * The store never crosses to the main thread. The UI asks for a window of
@@ -11,7 +12,16 @@ let store: DumpStore | null = null
 let current: Uint32Array = new Uint32Array(0)
 
 type Req =
-  | { id: number; op: 'parse'; buffer: ArrayBuffer; name: string }
+  | {
+      id: number
+      op: 'parse'
+      buffer: ArrayBuffer
+      name: string
+      /** 'pdx' skips the parser: the file is already a serialised column set. */
+      format?: 'text' | 'pdx'
+      /** Manifest id, when this arrived from the site's own dump list. */
+      source?: string
+    }
   | { id: number; op: 'restore'; key: string }
   | { id: number; op: 'query'; query: Query }
   | { id: number; op: 'window'; start: number; end: number }
@@ -43,26 +53,35 @@ async function handle(msg: Req) {
   switch (msg.op) {
     case 'parse': {
       const src = new Uint8Array(msg.buffer)
-      const key = fingerprint(msg.name, src)
+      // Hashed before anything else: the id is the file's content, so it is
+      // known even for a dump we turn out to already hold.
+      const key = contentHash(src)
       const cached = await loadDump(key).catch(() => undefined)
       if (cached) {
         store = new DumpStore(cached.cols)
         return { ...summary(), key, label: cached.label, cached: true }
       }
+
       const t0 = performance.now()
-      const cols = parseDump(src, (f) =>
-        self.postMessage({ id: -1, event: 'progress', fraction: f }),
-      )
+      const cols =
+        msg.format === 'pdx'
+          ? decodeBundle(msg.buffer)
+          : parseDump(src, (f) => self.postMessage({ id: -1, event: 'progress', fraction: f }))
       const ms = performance.now() - t0
+
       store = new DumpStore(cols)
+      const parsedAt = Date.now()
+      const label = titleFor(msg.name, parsedAt)
       await saveDump({
         key,
-        label: msg.name,
+        label,
+        name: msg.name,
+        source: msg.source,
         bytes: src.length,
-        parsedAt: Date.now(),
+        parsedAt,
         cols,
       }).catch(() => {})
-      return { ...summary(), key, label: msg.name, cached: false, parseMs: ms }
+      return { ...summary(), key, label, cached: false, parseMs: ms }
     }
 
     case 'restore': {

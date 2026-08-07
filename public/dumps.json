@@ -1,0 +1,12 @@
+{
+  "dumps": [
+    {
+      "id": "palworld-2026-08-07",
+      "file": "/PalDump_08_07_26.pdx",
+      "title": "Palworld · 2026-08-07",
+      "note": "Prebaked object dump. Loads without parsing.",
+      "bytes": 40128248,
+      "format": "pdx"
+    }
+  ]
+}

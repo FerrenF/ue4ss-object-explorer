@@ -43,8 +43,25 @@ async function toggle(node: Node) {
   node.open = true
 }
 
+/**
+ * Ordering is applied at render rather than at fetch, so flipping it costs a
+ * re-sort of the nodes already on screen and never re-walks the store. The
+ * store hands back count order; `localeCompare` with numeric collation is
+ * what makes `Item_2` precede `Item_10` in the alphabetical mode.
+ */
+const order = ref<'count' | 'alpha'>('count')
+const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' })
+
+function arrange(nodes: Node[]): Node[] {
+  const by =
+    order.value === 'alpha'
+      ? (a: Node, b: Node) => collator.compare(a.segment, b.segment)
+      : (a: Node, b: Node) => b.count - a.count || collator.compare(a.segment, b.segment)
+  return nodes.slice().sort(by)
+}
+
 function flatten(nodes: Node[], out: Node[] = []): Node[] {
-  for (const n of nodes) {
+  for (const n of arrange(nodes)) {
     out.push(n)
     if (n.open && n.children) flatten(n.children, out)
   }
@@ -60,7 +77,25 @@ watch(() => props.version, loadRoots)
   <nav class="spine">
     <div class="spine-head">
       <span class="eyebrow">Script path</span>
-      <button v-if="modelValue" class="clear" @click="emit('update:modelValue', '')">clear</button>
+      <div class="head-tools">
+        <div class="order" role="group" aria-label="Sort tree">
+          <button
+            :class="{ on: order === 'count' }"
+            title="Sort by number of objects"
+            @click="order = 'count'"
+          >
+            count
+          </button>
+          <button
+            :class="{ on: order === 'alpha' }"
+            title="Sort alphabetically"
+            @click="order = 'alpha'"
+          >
+            a–z
+          </button>
+        </div>
+        <button v-if="modelValue" class="clear" @click="emit('update:modelValue', '')">clear</button>
+      </div>
     </div>
 
     <div class="scroll">
@@ -118,11 +153,44 @@ watch(() => props.version, loadRoots)
   flex: none;
 }
 
+.head-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .clear {
   font-size: 10px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--amber);
+}
+
+.order {
+  display: flex;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.order button {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  padding: 3px 7px;
+  color: var(--dim);
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+.order button + button {
+  border-left: 1px solid var(--rule);
+}
+.order button:hover {
+  color: var(--ink);
+}
+.order button.on {
+  color: var(--ink-strong);
+  background: var(--raise);
 }
 
 .scroll {
