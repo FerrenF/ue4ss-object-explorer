@@ -44,10 +44,8 @@ async function toggle(node: Node) {
 }
 
 /**
- * Ordering is applied at render rather than at fetch, so flipping it costs a
- * re-sort of the nodes already on screen and never re-walks the store. The
- * store hands back count order; `localeCompare` with numeric collation is
- * what makes `Item_2` precede `Item_10` in the alphabetical mode.
+ * Ordering is applied at render rather than at fetch, so flipping it costs a re-sort of the nodes already on screen and never re-walks the store. The
+ * store hands back count order; `localeCompare` with numeric collation is what makes `Item_2` precede `Item_10` in the alphabetical mode.
  */
 const order = ref<'count' | 'alpha'>('count')
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' })

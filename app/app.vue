@@ -7,7 +7,7 @@ import { listDumps, dropDump, type CachedDump } from './lib/persist'
 import { listHosted, download, fileNameOf, type HostedDump } from './lib/hosted'
 import { encodeView, decodeView, emptyView, type ViewState } from './lib/view-state'
 import type { SortKey } from './lib/dump-store'
-import HeaderBar from '@/components/HeaderBar.vue'
+import HeaderBar from './components/HeaderBar.vue'
 const d = useDump()
 const frames = useFrames()
 

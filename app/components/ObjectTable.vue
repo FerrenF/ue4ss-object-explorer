@@ -29,12 +29,14 @@ const emit = defineEmits<{
  * existing path sort already pays) followed by the scroll reset that a new
  * query does anyway. Nothing has to be re-fetched or merged.
  */
-const COLUMNS: { key: SortKey; label: string; cls: string }[] = [
-  { key: 'address', label: 'ADDRESS', cls: 'col-addr' },
-  { key: 'type', label: 'TYPE', cls: 'col-type' },
-  { key: 'name', label: 'NAME', cls: 'col-name' },
-  { key: 'path', label: 'CONTAINER', cls: 'col-path' },
-  { key: 'offset', label: 'OFF', cls: 'col-off' },
+type ColId = 'addr' | 'type' | 'name' | 'path' | 'off'
+
+const COLUMNS: { id: ColId; key: SortKey; label: string; cls: string }[] = [
+  { id: 'addr', key: 'address', label: 'ADDRESS', cls: 'col-addr' },
+  { id: 'type', key: 'type', label: 'TYPE', cls: 'col-type' },
+  { id: 'name', key: 'name', label: 'NAME', cls: 'col-name' },
+  { id: 'path', key: 'path', label: 'CONTAINER', cls: 'col-path' },
+  { id: 'off', key: 'offset', label: 'OFF', cls: 'col-off' },
 ]
 
 /** asc → desc → off. The third click restores dump order, which is a view
@@ -47,6 +49,85 @@ function cycle(key: SortKey) {
 
 const arrow = (key: SortKey) =>
   props.sort !== key ? '' : props.descending ? '↓' : '↑'
+
+// --------------------------------------------------------------- column size
+
+const DEFAULT_W: Record<ColId, number> = { addr: 128, type: 138, name: 300, path: 420, off: 56 }
+const MIN_W = 44
+const GAP = 14
+const PAD = 12
+const WIDTH_KEY = 'pdx:column-widths'
+
+const widths = ref<Record<ColId, number>>({ ...DEFAULT_W })
+
+const vars = computed(() => {
+  const w = widths.value
+  const sum = COLUMNS.reduce((n, c) => n + w[c.id], 0)
+  return {
+    '--w-addr': w.addr + 'px',
+    '--w-type': w.type + 'px',
+    '--w-name': w.name + 'px',
+    '--w-path': w.path + 'px',
+    '--w-off': w.off + 'px',
+    // Header and rows both take this as a *minimum*: narrower than the
+    // viewport and CONTAINER absorbs the slack, wider and the table scrolls.
+    '--row-w': sum + GAP * (COLUMNS.length - 1) + PAD * 2 + 'px',
+  }
+})
+
+let drag: { id: ColId; x: number; from: number } | null = null
+
+function gripDown(e: PointerEvent, id: ColId) {
+  e.preventDefault()
+  const grip = e.currentTarget as HTMLElement
+  const rendered = grip.parentElement?.getBoundingClientRect().width
+  drag = { id, x: e.clientX, from: Math.round(rendered || widths.value[id]) }
+  grip.setPointerCapture(e.pointerId)
+}
+
+function gripMove(e: PointerEvent) {
+  if (!drag) return
+  widths.value = {
+    ...widths.value,
+    [drag.id]: Math.max(MIN_W, Math.round(drag.from + e.clientX - drag.x)),
+  }
+}
+
+function gripUp() {
+  if (!drag) return
+  drag = null
+  saveWidths()
+}
+
+/** Double-click a grip to put that one column back where it started. */
+function resetWidth(id: ColId) {
+  widths.value = { ...widths.value, [id]: DEFAULT_W[id] }
+  saveWidths()
+}
+
+function saveWidths() {
+  try {
+    localStorage.setItem(WIDTH_KEY, JSON.stringify(widths.value))
+  } catch {
+    /* private mode, or the quota is full; widths are not worth failing over */
+  }
+}
+
+function loadWidths() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(WIDTH_KEY) || 'null')
+    if (!raw) return
+    const next = { ...DEFAULT_W }
+    // Read key by key rather than trusting the blob: a stored layout from a
+    // build with different columns must not resurrect them.
+    for (const c of COLUMNS) {
+      if (Number.isFinite(raw[c.id])) next[c.id] = Math.max(MIN_W, raw[c.id])
+    }
+    widths.value = next
+  } catch {
+    /* unparseable; the defaults are already in place */
+  }
+}
 
 const ROW_H = 26
 const OVERSCAN = 24
@@ -85,8 +166,19 @@ function measure() {
 }
 
 onMounted(() => {
+  loadWidths()
   measure()
+  measureChar()
+  // Web fonts land after mount and change the glyph width under us.
+  document.fonts?.ready.then(measureChar).catch(() => {})
+
   new ResizeObserver(measure).observe(viewport.value!)
+
+  // Measuring the rendered header cell rather than reading `widths` picks up
+  // the flex growth too, which on a wide window is most of CONTAINER's width.
+  const head = viewport.value?.querySelector('.head .col-path')
+  if (head) new ResizeObserver(([e]) => (pathPx.value = e!.contentRect.width)).observe(head)
+
   refill()
 })
 
@@ -112,40 +204,84 @@ const visible = computed(() => {
 const hex = (n: number) => n.toString(16).toUpperCase().padStart(12, '0')
 
 /**
- * Show the tail of a long path, which is the part that identifies it.
- * Done in JS rather than with `direction: rtl`, because these strings are
- * full of slashes and colons — neutral characters that bidi reordering
- * happily moves to the wrong end.
+ * CONTAINER is the one column that cannot use CSS ellipsis.
+ *
+ * Ellipsis keeps the head of the string and drops the tail, and for a package
+ * path the tail is the part that identifies it — `…Engine.Actor:Tick` says
+ * something, `/Script/Game/Content/Bluepr…` says nothing. So it is trimmed in
+ * JS from the left. (Not with `direction: rtl`, which reorders the slashes
+ * and colons — they are bidi-neutral and end up in the wrong place.)
+ *
+ * The cost of doing it in JS is that the cut has to know the column's width
+ * in characters, which is measured rather than assumed: the column is now
+ * resizable, and it also flexes to absorb slack on a wide window.
  */
-function tail(s: string, max = 64) {
+const pathPx = ref(420)
+const charPx = ref(7.2)
+const containerMax = computed(() => Math.max(8, Math.floor((pathPx.value - 2) / charPx.value)))
+
+function tail(s: string, max: number) {
   return s.length <= max ? s : '…' + s.slice(s.length - max + 1)
+}
+
+/** Rows are monospaced, so one glyph measurement describes every string. */
+function measureChar() {
+  const ctx = document.createElement('canvas').getContext('2d')
+  if (!ctx) return
+  const mono = getComputedStyle(document.documentElement).getPropertyValue('--mono')
+  ctx.font = `12px ${mono || 'monospace'}`
+  const w = ctx.measureText('0'.repeat(64)).width / 64
+  if (w > 0) charPx.value = w
 }
 </script>
 
 <template>
-  <div class="table">
-    <header class="head mono">
-      <button
-        v-for="c in COLUMNS"
-        :key="c.key"
-        type="button"
-        class="sorter"
-        :class="[c.cls, { on: sort === c.key }]"
-        :title="
-          sort === c.key && descending
-            ? 'Sorted descending — click for dump order'
-            : sort === c.key
-              ? 'Sorted ascending — click for descending'
-              : `Sort by ${c.label.toLowerCase()}`
-        "
-        :aria-sort="sort === c.key ? (descending ? 'descending' : 'ascending') : 'none'"
-        @click="cycle(c.key)"
-      >
-        {{ c.label }}<i class="arrow">{{ arrow(c.key) }}</i>
-      </button>
-    </header>
-
+  <div class="table" :style="vars">
     <div ref="viewport" class="viewport" @scroll.passive="onScroll" tabindex="0">
+      <!-- Sticky rather than a sibling of the viewport, so that it scrolls
+           sideways with the rows it labels and needs no scroll syncing. -->
+      <header class="head mono">
+        <div
+          v-for="(c, i) in COLUMNS"
+          :key="c.key"
+          class="hcell"
+          :class="c.cls"
+        >
+          <button
+            type="button"
+            class="sorter"
+            :class="{ on: sort === c.key }"
+            :title="
+              sort === c.key && descending
+                ? 'Sorted descending — click for dump order'
+                : sort === c.key
+                  ? 'Sorted ascending — click for descending'
+                  : `Sort by ${c.label.toLowerCase()}`
+            "
+            :aria-sort="sort === c.key ? (descending ? 'descending' : 'ascending') : 'none'"
+            @click="cycle(c.key)"
+          >
+            {{ c.label }}<i class="arrow">{{ arrow(c.key) }}</i>
+          </button>
+          <!-- No grip on the last column: it would hang past the header's
+               padding, and OFF is a fixed-width hex field with nothing to
+               reveal. Widening the four to its left is the whole need. -->
+          <span
+            v-if="i < COLUMNS.length - 1"
+            class="grip"
+            role="separator"
+            aria-orientation="vertical"
+            :aria-label="`Resize ${c.label.toLowerCase()} column`"
+            title="Drag to resize · double-click to reset"
+            @pointerdown="gripDown($event, c.id)"
+            @pointermove="gripMove"
+            @pointerup="gripUp"
+            @pointercancel="gripUp"
+            @dblclick="resetWidth(c.id)"
+          />
+        </div>
+      </header>
+
       <div class="spacer" :style="{ height: total * ROW_H + 'px' }">
         <div
           v-for="cell in visible"
@@ -168,8 +304,10 @@ function tail(s: string, max = 64) {
               <i class="tick" :style="{ background: hue(cell.row.type) }" />
               {{ abbreviate(cell.row.type) }}
             </span>
-            <span class="col-name">{{ cell.row.name }}</span>
-            <span class="col-path" :title="cell.row.path">{{ tail(cell.row.container) }}</span>
+            <span class="col-name" :title="cell.row.name">{{ cell.row.name }}</span>
+            <span class="col-path" :title="cell.row.path">{{
+              tail(cell.row.container, containerMax)
+            }}</span>
             <span class="col-off">{{
               cell.row.offset < 0 ? '' : '0x' + cell.row.offset.toString(16).toUpperCase()
             }}</span>
@@ -192,12 +330,21 @@ function tail(s: string, max = 64) {
   flex: 1;
 }
 
+/* Sticky inside the scroller: pinned vertically, free to travel sideways with
+   the rows. `min-width` is what keeps its background under the far columns
+   once the table is scrolled right — width:100% alone would stop at the
+   viewport edge. */
 .head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
   display: flex;
   gap: 14px;
   padding: 0 12px;
   height: 28px;
-  align-items: center;
+  align-items: stretch;
+  width: 100%;
+  min-width: var(--row-w);
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.1em;
@@ -207,13 +354,24 @@ function tail(s: string, max = 64) {
   flex: none;
 }
 
-/* Headers are buttons but must keep the exact column geometry of the rows
-   below them, so they take the same .col-* classes and add nothing but the
-   affordance. */
+/* Header cells carry the same .col-* geometry as the row spans below them,
+   so the two stay aligned by construction rather than by arithmetic. */
+.head .hcell {
+  position: relative;
+  display: flex;
+  align-items: center;
+  color: var(--dim);
+  /* The .col-* classes clip their content so row text ellipsises, but the
+     grip hangs 13px into the gutter *past* this cell's edge — inheriting that
+     clip erases it. Labels still clip: .sorter hides its own overflow. */
+  overflow: visible;
+}
 .head .sorter {
   display: flex;
   align-items: center;
   gap: 4px;
+  flex: 1;
+  min-width: 0;
   height: 100%;
   padding: 0;
   font: inherit;
@@ -223,6 +381,7 @@ function tail(s: string, max = 64) {
   border: none;
   cursor: pointer;
   white-space: nowrap;
+  overflow: hidden;
 }
 .head .sorter:hover {
   color: var(--ink);
@@ -230,12 +389,41 @@ function tail(s: string, max = 64) {
 .head .sorter.on {
   color: var(--amber);
 }
-.head .sorter.col-off {
+.head .col-off .sorter {
   justify-content: flex-end;
 }
 .arrow {
   font-style: normal;
   font-size: 9px;
+}
+
+/* Sits in the 14px gutter between columns, straddling the boundary it moves.
+   Wider than it looks: 13px of target for a 1px line. */
+.grip {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: -13px;
+  width: 13px;
+  cursor: col-resize;
+  touch-action: none;
+  z-index: 1;
+}
+.grip::after {
+  content: '';
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  left: 6px;
+  width: 1px;
+  background: var(--rule);
+  transition: background 0.12s;
+}
+.grip:hover::after,
+.grip:active::after {
+  top: 0;
+  bottom: 0;
+  background: var(--amber);
 }
 
 .viewport {
@@ -247,6 +435,8 @@ function tail(s: string, max = 64) {
 
 .spacer {
   position: relative;
+  width: 100%;
+  min-width: var(--row-w);
 }
 
 .row {
@@ -275,12 +465,17 @@ function tail(s: string, max = 64) {
   opacity: 0.25;
 }
 
+/* Every width comes from the custom properties the script maintains, so a
+   drag moves the header cell and all ~60 live rows in one recalculation. */
+
 /* Signature: shared address digits recede, the differing tail stays lit. */
 .col-addr {
-  width: var(--gutter-w);
+  width: var(--w-addr);
   flex: none;
   color: var(--amber);
   letter-spacing: 0.03em;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .ghost {
   color: var(--dimmer);
@@ -288,7 +483,7 @@ function tail(s: string, max = 64) {
 }
 
 .col-type {
-  width: 138px;
+  width: var(--w-type);
   flex: none;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -303,31 +498,35 @@ function tail(s: string, max = 64) {
 }
 
 .col-name {
-  width: 300px;
+  width: var(--w-name);
   flex: none;
   color: var(--ink-strong);
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
+/* The one column that grows: on a window wider than the columns need, the
+   slack goes to the longest strings in the table rather than to dead space. */
 .col-path {
-  flex: 1;
-  min-width: 0;
+  flex: 1 0 var(--w-path);
+  width: var(--w-path);
+  min-width: var(--w-path);
   color: var(--dim);
   overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .col-off {
-  width: 56px;
+  width: var(--w-off);
   flex: none;
   text-align: right;
   color: var(--dim);
+  overflow: hidden;
 }
 
+/* Offset by the header's height, which now lives inside this scroller. */
 .empty {
   position: absolute;
-  inset: 0;
+  inset: 28px 0 0;
   display: grid;
   place-content: center;
   color: var(--dim);
@@ -338,13 +537,7 @@ function tail(s: string, max = 64) {
   line-height: 1.6;
 }
 
-@media (max-width: 900px) {
-  .col-name {
-    width: 180px;
-  }
-  .col-off,
-  .col-path {
-    display: none;
-  }
-}
+/* No narrow-screen column hiding any more: the table scrolls sideways, so a
+   phone gets the same columns and reaches them by dragging rather than being
+   told CONTAINER does not exist. */
 </style>
