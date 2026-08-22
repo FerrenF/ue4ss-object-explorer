@@ -2,6 +2,7 @@
 import { parseDump } from '../lib/dump-parse'
 import { decodeBundle } from '../lib/bundle'
 import { DumpStore, type Query } from '../lib/dump-store'
+import { buildReport } from '../lib/report'
 import { contentHash, titleFor, saveDump, loadDump } from '../lib/persist'
 
 /**
@@ -10,6 +11,8 @@ import { contentHash, titleFor, saveDump, loadDump } from '../lib/persist'
  */
 let store: DumpStore | null = null
 let current: Uint32Array = new Uint32Array(0)
+/** Title of the open dump, so a report can name what it was taken from. */
+let currentLabel = ''
 
 type Req =
   | {
@@ -27,6 +30,7 @@ type Req =
   | { id: number; op: 'window'; start: number; end: number }
   | { id: number; op: 'children'; prefix: string }
   | { id: number; op: 'resolve'; address: number }
+  | { id: number; op: 'report'; prefix: string }
   | { id: number; op: 'close' }
 
 function summary() {
@@ -59,6 +63,7 @@ async function handle(msg: Req) {
       const cached = await loadDump(key).catch(() => undefined)
       if (cached) {
         store = new DumpStore(cached.cols)
+        currentLabel = cached.label
         return { ...summary(), key, label: cached.label, cached: true }
       }
 
@@ -72,6 +77,7 @@ async function handle(msg: Req) {
       store = new DumpStore(cols)
       const parsedAt = Date.now()
       const label = titleFor(msg.name, parsedAt)
+      currentLabel = label
       await saveDump({
         key,
         label,
@@ -88,6 +94,7 @@ async function handle(msg: Req) {
       const cached = await loadDump(msg.key)
       if (!cached) throw new Error('That dump is no longer cached. Load the file again.')
       store = new DumpStore(cached.cols)
+      currentLabel = cached.label
       return { ...summary(), key: cached.key, label: cached.label, cached: true }
     }
 
@@ -118,11 +125,21 @@ async function handle(msg: Req) {
       return { row: row >= 0 ? store!.row(row) : null }
     }
 
+    // Built here rather than on the main thread: the report walks the whole
+    // subtree and decodes a string per field, and only the finished text
+    // crosses back.
+    case 'report': {
+      const s = store!
+      const rows = s.subtree(msg.prefix)
+      return buildReport(s, rows, { root: msg.prefix, label: currentLabel })
+    }
+
     // Drops the only references to the columns; the dump stays in IndexedDB,
     // so 'restore' can bring it back without re-parsing.
     case 'close': {
       store = null
       current = new Uint32Array(0)
+      currentLabel = ''
       return { closed: true }
     }
   }

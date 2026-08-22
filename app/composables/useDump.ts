@@ -151,6 +151,9 @@ export function useDump() {
   const resolveAddress = (address: number) =>
     call<{ row: RowView | null }>('resolve', { address })
 
+  const buildReport = (prefix: string) =>
+    call<{ text: string; objects: number; truncated: boolean }>('report', { prefix })
+
   return {
     loadFile,
     loadBuffer,
@@ -160,6 +163,7 @@ export function useDump() {
     fetchWindow,
     fetchChildren,
     resolveAddress,
+    buildReport,
     loading,
     progress,
     error,

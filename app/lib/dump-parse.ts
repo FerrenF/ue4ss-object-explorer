@@ -12,17 +12,13 @@
  *                     next line, leaving one line with no trailing groups and
  *                     one with no `[ADDR]` prefix.
  *
- * Two things make shape 1 harder than it looks:
+ * Notes:
  *
- *   - ObjectPath CAN contain spaces (`... (Director BP)_C:UberGraphFrame`,
- *     `Default__SkyCreator:Sun Light Component`) - 5.6k lines' worth. So the
- *     path is not "up to the first space"; the trailing `[k: v]` groups have
- *     to be peeled off the RIGHT and the path is whatever is left.
- *   - Enum constants have no path at all, so a left-to-right scan reads the
- *     first group as the path and files 15k objects under a bogus `[n` root.
+ *   - ObjectPath CAN contain spaces (`... (Director BP)_C:UberGraphFrameDefault__SkyCreator:Sun Light Component`) - 5.6k lines' worth. So the
+ *     path is not "up to the first space"; the trailing `[k: v]` groups have to be peeled off the RIGHT and the path is whatever is left.
+ *   - Enum constants have no path at all, so a left-to-right scan reads the first group as the path and files 15k objects under a bogus `[n` root.
  *
- * Peeling from the right is only safe because no object path in the dump
- * contains `[` or `]`; that is asserted by treating a leftover bracket in the
+ * Peeling from the right is only safe because no object path in the dump contains `[` or `]`; that is asserted by treating a leftover bracket in the
  * path region as damage rather than as text.
  */
 
@@ -56,10 +52,10 @@ export interface DumpColumns {
    *
    * rootOff:
    *
-   * Byte offset at which the real `/...` path begins. Array inner properties
-   * are dumped as `ComponentTags./Script/Engine.ActorComponent:ComponentTags`;
-   * that leading qualifier is kept for display but skipped when indexing, so
-   * the inner property files under its array rather than at the tree root.
+   * Byte offset at which the real `/...` path begins.
+   * 
+   * Array inner properties are dumped as `ComponentTags./Script/Engine.ActorComponent:ComponentTags`;
+   * that leading qualifier is kept for display but skipped when indexing, so the inner property files under its array rather than at the tree root.
    */
   rootOff: Uint16Array
   outer: Float64Array // Address from `or:` (outer) or `owr:` (owner), whichever the line carried. 0 = none.

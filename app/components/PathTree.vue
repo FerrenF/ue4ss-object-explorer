@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, watch } from 'vue'
+import { ref, onMounted, onBeforeUnmount, watch } from 'vue'
 import type { TreeChild } from '../lib/dump-store'
 
 const props = defineProps<{
@@ -7,18 +7,21 @@ const props = defineProps<{
   fetchChildren: (prefix: string) => Promise<{ prefix: string; children: TreeChild[] }>
   version: number
 }>()
-const emit = defineEmits<{ (e: 'update:modelValue', v: string): void }>()
+const emit = defineEmits<{
+  (e: 'update:modelValue', v: string): void
+  (e: 'dump', path: string): void
+}>()
 
-interface Node extends TreeChild {
+interface TreeNode extends TreeChild {
   depth: number
   open: boolean
-  children: Node[] | null
+  children: TreeNode[] | null
   loading: boolean
 }
 
-const roots = ref<Node[]>([])
+const roots = ref<TreeNode[]>([])
 
-function toNode(c: TreeChild, depth: number): Node {
+function toNode(c: TreeChild, depth: number): TreeNode {
   return { ...c, depth, open: false, children: null, loading: false }
 }
 
@@ -29,7 +32,7 @@ async function loadRoots() {
   if (roots.value.length === 1 && roots.value[0]) toggle(roots.value[0])
 }
 
-async function toggle(node: Node) {
+async function toggle(node: TreeNode) {
   if (node.open) {
     node.open = false
     return
@@ -43,22 +46,18 @@ async function toggle(node: Node) {
   node.open = true
 }
 
-/**
- * Ordering is applied at render rather than at fetch, so flipping it costs a re-sort of the nodes already on screen and never re-walks the store. The
- * store hands back count order; `localeCompare` with numeric collation is what makes `Item_2` precede `Item_10` in the alphabetical mode.
- */
 const order = ref<'count' | 'alpha'>('count')
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' })
 
-function arrange(nodes: Node[]): Node[] {
+function arrange(nodes: TreeNode[]): TreeNode[] {
   const by =
     order.value === 'alpha'
-      ? (a: Node, b: Node) => collator.compare(a.segment, b.segment)
-      : (a: Node, b: Node) => b.count - a.count || collator.compare(a.segment, b.segment)
+      ? (a: TreeNode, b: TreeNode) => collator.compare(a.segment, b.segment)
+      : (a: TreeNode, b: TreeNode) => b.count - a.count || collator.compare(a.segment, b.segment)
   return nodes.slice().sort(by)
 }
 
-function flatten(nodes: Node[], out: Node[] = []): Node[] {
+function flatten(nodes: TreeNode[], out: TreeNode[] = []): TreeNode[] {
   for (const n of arrange(nodes)) {
     out.push(n)
     if (n.open && n.children) flatten(n.children, out)
@@ -66,8 +65,66 @@ function flatten(nodes: Node[], out: Node[] = []): Node[] {
   return out
 }
 
+// ------------------------------------------------------------ context menu
+
+const menu = ref<{ x: number; y: number; path: string; label: string } | null>(null)
+const menuEl = ref<HTMLElement | null>(null)
+
+let armed = false
+
+function arm() {
+  if (armed) return
+  armed = true
+  window.addEventListener('pointerdown', onOutside)
+  window.addEventListener('keydown', onKey)
+  window.addEventListener('resize', closeMenu)
+  // Capture, because the scroll that matters happens in .scroll, not on window.
+  window.addEventListener('scroll', closeMenu, true)
+}
+
+function disarm() {
+  if (!armed) return
+  armed = false
+  window.removeEventListener('pointerdown', onOutside)
+  window.removeEventListener('keydown', onKey)
+  window.removeEventListener('resize', closeMenu)
+  window.removeEventListener('scroll', closeMenu, true)
+}
+
+function onOutside(e: PointerEvent) {
+  if (menuEl.value?.contains(e.target as Node)) return
+  closeMenu()
+}
+
+function onKey(e: KeyboardEvent) {
+  if (e.key === 'Escape') closeMenu()
+}
+
+function openMenu(e: MouseEvent, node: TreeNode) {
+  // Clamped so a right-click near the bottom or right edge does not open the
+  // menu off-screen; the sizes are the menu's own, which is fixed content.
+  menu.value = {
+    x: Math.min(e.clientX, window.innerWidth - 240),
+    y: Math.min(e.clientY, window.innerHeight - 60),
+    path: node.path,
+    label: node.segment,
+  }
+  requestAnimationFrame(arm)
+}
+
+function closeMenu() {
+  menu.value = null
+  disarm()
+}
+
+function dumpFromMenu() {
+  if (menu.value) emit('dump', menu.value.path)
+  closeMenu()
+}
+
 const fmt = new Intl.NumberFormat()
 onMounted(loadRoots)
+onBeforeUnmount(disarm)
 watch(() => props.version, loadRoots)
 </script>
 
@@ -109,8 +166,9 @@ watch(() => props.version, loadRoots)
         v-for="node in flatten(roots)"
         :key="node.path"
         class="node mono"
-        :class="{ active: modelValue === node.path }"
+        :class="{ active: modelValue === node.path, aimed: menu?.path === node.path }"
         :style="{ paddingLeft: 8 + node.depth * 13 + 'px' }"
+        @contextmenu.prevent="openMenu($event, node)"
       >
         <button
           class="twist"
@@ -128,6 +186,21 @@ watch(() => props.version, loadRoots)
         </button>
       </div>
     </div>
+
+    <!-- Teleported out of the .spine, which scrolls and clips. -->
+    <Teleport to="body">
+      <div
+        v-if="menu"
+        ref="menuEl"
+        class="menu mono"
+        :style="{ left: menu.x + 'px', top: menu.y + 'px' }"
+        @contextmenu.prevent
+      >
+        <button @click="dumpFromMenu">
+          Dump tree under <b>{{ menu.label }}</b>
+        </button>
+      </div>
+    </Teleport>
   </nav>
 </template>
 
@@ -214,6 +287,11 @@ watch(() => props.version, loadRoots)
   background: var(--amber-soft);
   color: var(--ink-strong);
 }
+/* Keeps the right-clicked row identifiable while the menu is over it. */
+.node.aimed {
+  background: var(--raise);
+  box-shadow: inset 2px 0 0 var(--amber);
+}
 .node.root {
   padding-left: 21px;
   color: var(--dim);
@@ -266,6 +344,42 @@ watch(() => props.version, loadRoots)
   font-size: 10px;
   color: var(--dimmer);
   flex: none;
+}
+
+/* Teleported to <body>, but Vue still stamps it with this component's scope
+   id, so these rules reach it. */
+.menu {
+  position: fixed;
+  z-index: 50;
+  min-width: 210px;
+  padding: 4px;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  box-shadow: 0 10px 28px rgb(0 0 0 / 45%);
+}
+.menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--ink);
+  background: none;
+  border: none;
+  border-radius: 2px;
+  padding: 7px 9px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.menu button b {
+  font-weight: 400;
+  color: var(--amber);
+}
+.menu button:hover {
+  background: var(--raise);
 }
 
 @media (max-width: 900px) {

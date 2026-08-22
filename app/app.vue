@@ -25,26 +25,13 @@ const showAllTypes = ref(false)
 const dragging = ref(false)
 const treeVersion = ref(0)
 
-/**
- * Filters carried in from a link, held until the dump they belong to is up.
- *
- * The hash is kept alongside them so that a recipient who did not have the
- * dump, and then loads the file by hand, still lands on the sender's view —
- * while someone who opens an unrelated dump instead does not inherit filters
- * meant for a different one.
- */
+// pending view
 const pending = ref<{ hash: string; view: ViewState } | null>(null)
 
 const fmt = new Intl.NumberFormat()
 
-// ------------------------------------------------------------------ the view
+// --- view
 
-/**
- * Type filters travel as names, not as the ids the store indexes by, so both
- * directions have to go through the dump's type table. A name the current
- * dump does not have simply drops out — a link from a newer dump should lose
- * the filter it cannot express, not fail to open.
- */
 function currentView(): ViewState {
   return {
     prefix: pathPrefix.value,
@@ -78,13 +65,6 @@ function schedule() {
   timer = setTimeout(commit, 120)
 }
 
-/**
- * The one path by which a filter change becomes a frame, a URL and a query.
- *
- * Replaying a frame runs through here too, and needs no guard against
- * recording itself: after `applyView` the refs are *equal* to the frame at
- * the cursor, and `push` drops a frame identical to the current one.
- */
 function commit() {
   const v = currentView()
   frames.push(v)
@@ -107,8 +87,7 @@ async function run() {
 watch([nameQuery, pathQuery], schedule)
 watch([pathPrefix, activeTypes, sort, descending], commit, { deep: true })
 
-/** A new dump invalidates every frame: the paths and types are a different
- *  vocabulary, so the queue restarts rather than carrying over. */
+/** A new dump invalidates every frame: the paths and types are a different vocabulary, so the queue restarts rather than carrying over. */
 function resetTo(v: ViewState) {
   applyView(v)
   inspected.value = null
@@ -134,6 +113,11 @@ watch(d.count, () => {
 function setSort(key: SortKey, desc: boolean) {
   sort.value = key
   descending.value = desc
+}
+
+function clearHistory() {
+  frames.clear()
+  syncUrl(currentView())
 }
 
 function step(delta: -1 | 1) {
@@ -184,6 +168,25 @@ function jumpTo(path: string) {
   pathQuery.value = ''
 }
 
+// -------------------------------------------------------------- subtree dump
+
+const report = ref({ open: false, root: '', text: '', objects: 0, truncated: false, error: '' })
+const reportLoading = ref(false)
+
+/** Walk everything at or under `path` and render it as a reference sheet. */
+async function dumpSubtree(path: string) {
+  report.value = { open: true, root: path, text: '', objects: 0, truncated: false, error: '' }
+  reportLoading.value = true
+  try {
+    const r = await d.buildReport(path)
+    report.value = { ...report.value, ...r }
+  } catch (e) {
+    report.value = { ...report.value, error: (e as Error).message }
+  } finally {
+    reportLoading.value = false
+  }
+}
+
 async function onDrop(e: DragEvent) {
   dragging.value = false
   const file = e.dataTransfer?.files?.[0]
@@ -204,25 +207,22 @@ async function forget(key: string) {
   refreshCached()
 }
 
-// ---------------------------------------------------------------- site dumps
+// --- site dumps
 
 const grabbing = ref('')
 const grabPct = ref<number | null>(0)
 const grabError = ref('')
 
-/** Only dumps this browser has not already taken. The cached copy records the
- *  manifest id it came from, which is what makes "already have it" answerable
- *  without re-hashing a 37 MB file. */
+/** Only dumps this browser has not already taken. */
 const offered = computed(() => {
   const have = new Set(cached.value.map((c) => c.source).filter(Boolean))
   return hosted.value.filter((h) => !have.has(h.id))
 })
 
 /**
- * Download on demand, never on load. One interaction fetches, caches, and
- * opens the dump, so the offer disappearing from this list is the same
- * gesture that puts it on screen.
+ * Download on demand, never on load.
  */
+
 async function grab(h: HostedDump) {
   grabbing.value = h.id
   grabError.value = ''
@@ -239,21 +239,15 @@ async function grab(h: HostedDump) {
   }
 }
 
-/** Unload the dump and drop back to the intro screen. The parsed copy stays
- *  in IndexedDB, so it reappears under "Already parsed". */
+
 async function clearDump() {
-  // The d.count watcher runs resetTo(), which clears every filter, the frame
-  // queue and the URL. Only the things outside that surface are left here.
   await d.reset()
   dragging.value = false
 }
 
-/**
- * A link carries a dump hash and a set of filters, but never the dump — 37 MB
- * does not fit in a URL. The recipient either already has that dump in
- * IndexedDB, in which case it opens with the sender's filters intact, or they
- * do not, and they land on the normal intro with a note saying so.
- */
+
+
+// 'cache miss' client did not have downloaded dump
 const linkMiss = ref(false)
 
 onMounted(async () => {
@@ -267,9 +261,7 @@ onMounted(async () => {
   pending.value = { hash: dump, view }
   if (!(await d.restore(dump))) {
     linkMiss.value = true
-    // Not surfaced as an error: a link arriving without its dump is the
-    // expected case, and `linkMiss` says so in plainer terms. The pending
-    // view stays put so that loading the file by hand still lands on it.
+    // a link arriving without its dump is the expected case
     d.error.value = ''
   }
 })
@@ -368,6 +360,7 @@ const mb = (n: number) => (n / 1e6).toFixed(1) + ' MB'
         v-model="pathPrefix"
         :fetch-children="d.fetchChildren"
         :version="treeVersion"
+        @dump="dumpSubtree"
       />
 
       <section class="main">
@@ -376,6 +369,15 @@ const mb = (n: number) => (n / 1e6).toFixed(1) + ' MB'
             <!-- Filter history. Every change to the query surface lands here as
                  a frame, so stepping back is stepping back through views. -->
             <div class="frames mono">
+              <button
+                class="wipe"
+                :disabled="frames.frames.value.length < 2"
+                title="Clear filter history"
+                aria-label="Clear filter history"
+                @click="clearHistory"
+              >
+                ×
+              </button>
               <button
                 :disabled="!frames.canBack.value"
                 title="Previous view"
@@ -479,8 +481,20 @@ const mb = (n: number) => (n / 1e6).toFixed(1) + ' MB'
           </dd>
         </dl>
         <button class="scope" @click="jumpTo(inspected.path)">Scope tree to this object</button>
+        <button class="scope" @click="dumpSubtree(inspected.path)">Dump tree under this object</button>
       </aside>
     </main>
+
+    <ReportModal
+      :open="report.open"
+      :root="report.root"
+      :text="report.text"
+      :objects="report.objects"
+      :truncated="report.truncated"
+      :error="report.error"
+      :loading="reportLoading"
+      @close="report.open = false"
+    />
 
     <div v-if="dragging && d.ready.value" class="veil mono">Release to parse a new dump</div>
   </div>
@@ -674,6 +688,17 @@ const mb = (n: number) => (n / 1e6).toFixed(1) + ' MB'
 .frames button:not(:disabled):hover {
   background: var(--raise);
 }
+
+/* Destructive, so it reads as an aside to the two arrows rather than a third
+   navigation control. */
+.frames .wipe {
+  color: var(--dim);
+  font-size: 13px;
+  border-right: 1px solid var(--rule);
+}
+.frames .wipe:not(:disabled):hover {
+  color: var(--t-bool);
+}
 .tally {
   font-size: 10px;
   color: var(--dim);
@@ -832,6 +857,10 @@ const mb = (n: number) => (n / 1e6).toFixed(1) + ' MB'
 }
 .link:hover {
   text-decoration: underline;
+}
+
+.scope + .scope {
+  margin-top: 6px;
 }
 
 .scope {

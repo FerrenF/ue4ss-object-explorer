@@ -35,7 +35,7 @@ function encodeLower(s: string): Uint8Array {
 export class DumpStore {
   readonly cols: DumpColumns
   private decoder = new TextDecoder()
-  /** Row indices ordered by path bytes. Built lazily; powers the tree. */
+  /** Row indices ordered by path bytes. */
   private byPath: Uint32Array | null = null
 
   constructor(cols: DumpColumns) {
@@ -51,11 +51,7 @@ export class DumpStore {
     return this.decoder.decode(pathBlob.subarray(pathStart[row]!, pathStart[row + 1]!))
   }
 
-  /**
-   * A zero here is a real value, not a missing one: row 0 starts at
-   * pathStart 0, and nameOff is 0 for any path with no separator at all
-   * (`CIM_Linear`). Guarding with `!x` dropped both.
-   */
+
   name(row: number): string {
     const { pathStart, pathBlob, nameOff } = this.cols
     return this.decoder.decode(
@@ -63,7 +59,6 @@ export class DumpStore {
     )
   }
 
-  /** Path minus the leaf name, minus the trailing separator. */
   container(row: number): string {
     const { pathStart, pathBlob, nameOff } = this.cols
     if (!nameOff[row]) return '' // the whole path is the name
@@ -95,7 +90,7 @@ export class DumpStore {
     }
   }
 
-  // ---------------------------------------------------------------- matching
+  // --- matching
 
   // rootOff is 0 for every path that already starts with '/', which is nearly
   // all of them, so the old `!rootOff[row]` guard rejected everything except
@@ -128,14 +123,9 @@ export class DumpStore {
     return false
   }
 
-  // ------------------------------------------------------------------ query
+  // --- query
 
-  /**
-   * Single linear pass over every row. At 800k rows this is single-digit
-   * milliseconds for type filters and ~40 ms for a substring scan, which is
-   * why there is no inverted index here — it would cost more to maintain
-   * than it saves.
-   */
+
   query(q: Query): { rows: Uint32Array; typeCounts: Int32Array } {
     const { count, typeId, types } = this.cols
     const typeCounts = new Int32Array(types.length)
@@ -288,6 +278,30 @@ export class DumpStore {
       else hi = mid
     }
     return [start, lo]
+  }
+
+  /**
+   * Every row at exactly `prefix` or beneath it, in path order.
+   */
+  subtree(prefix: string): Uint32Array {
+    const order = this.ensurePathOrder()
+    if (!prefix) return order.slice()
+
+    const pat = new TextEncoder().encode(prefix)
+    const [lo, hi] = this.range(pat)
+    const { pathStart, pathBlob, rootOff } = this.cols
+
+    const out = new Uint32Array(hi - lo)
+    let n = 0
+    for (let i = lo; i < hi; i++) {
+      const row = order[i]!
+      const after = pathStart[row]! + rootOff[row]! + pat.length
+      const end = pathStart[row + 1]!
+      if (after > end) continue
+      const c = pathBlob[after]
+      if (after === end || c === SLASH || c === DOT || c === COLON) out[n++] = row
+    }
+    return out.slice(0, n)
   }
 
   private childCache = new Map<string, TreeChild[]>()
