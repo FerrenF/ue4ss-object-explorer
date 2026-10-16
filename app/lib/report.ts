@@ -12,8 +12,6 @@ import { KIND_ENUM } from './dump-parse'
  * to write", with functions given the offset table that is the whole point.
  */
 
-const FUNCTION_TYPES = new Set(['Function', 'DelegateFunction', 'SparseDelegateFunction'])
-
 /** Beyond this the report stops being a reference and starts being the dump. */
 export const REPORT_CAP = 25_000
 
@@ -69,15 +67,6 @@ export function buildReport(
   // `store.row` decodes strings out of the path blob each time it is called.
   const objs = Array.from(used, (r) => store.row(r))
 
-  // Children are grouped by their container so that a function can find its
-  // parameters without a second scan per function.
-  const byContainer = new Map<string, typeof objs>()
-  for (const o of objs) {
-    const list = byContainer.get(o.container)
-    if (list) list.push(o)
-    else byContainer.set(o.container, [o])
-  }
-
   const out: string[] = []
   const { root, label } = meta
 
@@ -112,7 +101,7 @@ export function buildReport(
   out.push('')
 
   // ------------------------------------------------------------ functions
-  const fns = objs.filter((o) => FUNCTION_TYPES.has(o.type))
+  const fns = objs.filter((o) => o.role === 'function')
   if (fns.length) {
     out.push('FUNCTIONS')
     out.push('-'.repeat(72))
@@ -122,7 +111,10 @@ export function buildReport(
     for (const f of fns) {
       // Declaration order is offset order: UE lays parameters out in the
       // params struct in the order they are declared, return value last.
-      const params = (byContainer.get(f.path) ?? []).slice().sort((a, b) => a.offset - b.offset)
+      // Found by owner pointer, so a param outside a truncated report still lists.
+      const params = Array.from(store.members(f.index), (r) => store.row(r)).sort(
+        (a, b) => a.offset - b.offset,
+      )
 
       out.push(f.path)
       out.push(`  name      ${f.name}`)
@@ -134,9 +126,10 @@ export function buildReport(
       } else {
         out.push(`  params    ${params.length}`)
         const w = Math.max(...params.map((p) => p.name.length), 4)
-        out.push(`    ${'OFFSET'.padEnd(9)}${'NAME'.padEnd(w + 2)}TYPE`)
+        const t = Math.max(...params.map((p) => p.type.length), 4)
+        out.push(`    ${'OFFSET'.padEnd(9)}${'NAME'.padEnd(w + 2)}${'TYPE'.padEnd(t + 2)}ROLE`)
         for (const p of params) {
-          out.push(`    ${hexOff(p.offset).padEnd(9)}${p.name.padEnd(w + 2)}${p.type}`)
+          out.push(`    ${hexOff(p.offset).padEnd(9)}${p.name.padEnd(w + 2)}${p.type.padEnd(t + 2)}${p.role}`)
         }
       }
       out.push('')

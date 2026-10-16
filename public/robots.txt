@@ -1,0 +1,5 @@
+User-agent: *
+# Prebaked dumps are multi-MB binaries with nothing to index.
+Disallow: /*.pdx$
+
+Sitemap: https://u34ss-explorer.gimme.pet/sitemap.xml

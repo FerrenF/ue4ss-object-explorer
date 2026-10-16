@@ -1,5 +1,5 @@
 import { ref, shallowRef, computed } from 'vue'
-import type { Query } from '../lib/dump-store'
+import type { Query, Role } from '../lib/dump-store'
 import type { TreeChild } from '../lib/dump-store'
 
 export interface RowView {
@@ -12,6 +12,20 @@ export interface RowView {
   container: string
   outer: number
   offset: number
+  role: Role
+  /** Row whose selection highlights this one as a unit. */
+  group: number
+  /** Nesting depth in the current view; only set on table rows. */
+  depth?: number
+  /** Shown only as the owner of a match, not as a match itself. */
+  ctx?: boolean
+}
+
+export interface Members {
+  head: RowView | null
+  members: RowView[]
+  /** Before the inspector cap. */
+  total: number
 }
 
 let worker: Worker | null = null
@@ -28,7 +42,12 @@ const skipped = ref(0)
 const types = shallowRef<string[]>([])
 const typeCounts = shallowRef<Int32Array>(new Int32Array(0))
 const sharedAddressDigits = ref(0)
+/** Display rows, including owners shown for context. */
 const total = ref(0)
+/** Rows that matched the query. */
+const matches = ref(0)
+/** Bumped per query, so the table refetches even when `total` happens not to change (a re-sort). */
+const revision = ref(0)
 const queryMs = ref(0)
 const parseMs = ref(0)
 
@@ -114,6 +133,7 @@ export function useDump() {
     skipped.value = 0
     sharedAddressDigits.value = 0
     total.value = 0
+    matches.value = 0
     queryMs.value = 0
     parseMs.value = 0
     // Last: `ready` and the app's reset watcher both hang off this.
@@ -137,8 +157,10 @@ export function useDump() {
     }
     const r = await call('query', { query: plain })
     total.value = r.total
+    matches.value = r.matches
     typeCounts.value = r.typeCounts
     queryMs.value = r.ms
+    revision.value++
     return r
   }
 
@@ -150,6 +172,8 @@ export function useDump() {
 
   const resolveAddress = (address: number) =>
     call<{ row: RowView | null }>('resolve', { address })
+
+  const fetchMembers = (row: number) => call<Members>('members', { row })
 
   const buildReport = (prefix: string) =>
     call<{ text: string; objects: number; truncated: boolean }>('report', { prefix })
@@ -163,6 +187,7 @@ export function useDump() {
     fetchWindow,
     fetchChildren,
     resolveAddress,
+    fetchMembers,
     buildReport,
     loading,
     progress,
@@ -175,6 +200,8 @@ export function useDump() {
     typeCounts,
     sharedAddressDigits,
     total,
+    matches,
+    revision,
     queryMs,
     parseMs,
     ready: computed(() => count.value > 0),

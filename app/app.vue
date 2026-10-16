@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue'
-import { useDump, type RowView } from './composables/useDump'
+import { useDump, type RowView, type Members } from './composables/useDump'
 import { useFrames } from './composables/useFrames'
 import { hue, abbreviate } from './lib/type-hue'
 import { listDumps, dropDump, type CachedDump } from './lib/persist'
@@ -19,6 +19,7 @@ const sort = ref<SortKey>('natural')
 const descending = ref(false)
 const inspected = ref<RowView | null>(null)
 const outerOf = ref<RowView | null>(null)
+const members = ref<Members | null>(null)
 const cached = ref<CachedDump[]>([])
 const hosted = ref<HostedDump[]>([])
 const showAllTypes = ref(false)
@@ -92,6 +93,7 @@ function resetTo(v: ViewState) {
   applyView(v)
   inspected.value = null
   outerOf.value = null
+  members.value = null
   showAllTypes.value = false
   treeVersion.value++
   frames.reset(currentView())
@@ -156,11 +158,47 @@ const shownChips = computed(() =>
   showAllTypes.value ? typeChips.value : typeChips.value.slice(0, 14),
 )
 
+let inspectSeq = 0
 async function inspect(row: RowView) {
+  const seq = ++inspectSeq
   inspected.value = row
   outerOf.value = null
-  if (row.outer) outerOf.value = (await d.resolveAddress(row.outer)).row
+  const [owner, m] = await Promise.all([
+    row.outer ? d.resolveAddress(row.outer).then((r) => r.row) : null,
+    d.fetchMembers(row.index),
+  ])
+  // A quicker click elsewhere wins; a slow answer must not overwrite it.
+  if (seq !== inspectSeq) return
+  outerOf.value = owner
+  members.value = m
 }
+
+function closeInspector() {
+  inspected.value = null
+  members.value = null
+}
+
+/**
+ * The inspector's member list, split the way a reader uses it: for a function,
+ * what you pass, what you get back, and the Blueprint temporaries last; for a
+ * class or struct, its properties and then its functions.
+ */
+const memberSections = computed(() => {
+  const m = members.value
+  if (!m?.head) return []
+  const all = m.members
+  if (m.head.role === 'function') {
+    return [
+      { label: 'Params', rows: all.filter((r) => r.role === 'param'), dim: false },
+      { label: 'Returns', rows: all.filter((r) => r.role === 'return'), dim: false },
+      { label: 'Locals', rows: all.filter((r) => r.role === 'local'), dim: true },
+    ].filter((s) => s.rows.length)
+  }
+  return [
+    { label: 'Properties', rows: all.filter((r) => r.role !== 'function'), dim: false },
+    { label: 'Functions', rows: all.filter((r) => r.role === 'function'), dim: false },
+  ].filter((s) => s.rows.length)
+})
 
 function jumpTo(path: string) {
   pathPrefix.value = path
@@ -438,16 +476,26 @@ const mb = (n: number) => (n / 1e6).toFixed(1) + ' MB'
 
         <ObjectTable
           :total="d.total.value"
+          :revision="d.revision.value"
           :shared-digits="d.sharedAddressDigits.value"
           :sort="sort"
           :descending="descending"
+          :selected-index="inspected?.index ?? -1"
+          :selected-group="inspected?.group ?? -1"
           :fetch-window="d.fetchWindow"
           @inspect="inspect"
           @sort="setSort"
+          @scope="jumpTo"
         />
 
         <footer class="status mono">
-          <span>{{ fmt.format(d.total.value) }} / {{ fmt.format(d.count.value) }} shown</span>
+          <span>{{ fmt.format(d.matches.value) }} / {{ fmt.format(d.count.value) }} shown</span>
+          <template v-if="d.total.value > d.matches.value">
+            <span class="sep">·</span>
+            <span :title="'Owners listed so each match appears under its parent'">
+              +{{ fmt.format(d.total.value - d.matches.value) }} owners
+            </span>
+          </template>
           <span class="sep">·</span>
           <span>{{ d.queryMs.value.toFixed(0) }} ms</span>
           <span v-if="d.parseMs.value" class="sep">·</span>
@@ -459,7 +507,7 @@ const mb = (n: number) => (n / 1e6).toFixed(1) + ' MB'
       <aside v-if="inspected" class="inspect">
         <div class="inspect-head">
           <span class="eyebrow">Object</span>
-          <button @click="inspected = null">×</button>
+          <button @click="closeInspector">×</button>
         </div>
         <dl class="mono">
           <dt>type</dt>
@@ -480,6 +528,42 @@ const mb = (n: number) => (n / 1e6).toFixed(1) + ' MB'
             <button class="link" @click="jumpTo(outerOf.path)">{{ outerOf.path }}</button>
           </dd>
         </dl>
+
+        <!-- Signature for a function (or the function a parameter belongs
+             to); member list for a class or struct. -->
+        <section v-if="members?.head" class="members mono">
+          <div class="members-head">
+            <span class="eyebrow">{{ members.head.role === 'function' ? 'Signature' : 'Members' }}</span>
+            <button
+              v-if="members.head.index !== inspected.index"
+              class="link"
+              :title="members.head.path"
+              @click="inspect(members.head)"
+            >
+              {{ members.head.name }}
+            </button>
+          </div>
+          <p v-if="!memberSections.length" class="members-none">none</p>
+          <div v-for="s in memberSections" :key="s.label" class="members-group" :class="{ dim: s.dim }">
+            <p class="members-label">{{ s.label }} <b>{{ s.rows.length }}</b></p>
+            <button
+              v-for="m in s.rows"
+              :key="m.index"
+              class="member"
+              :class="{ on: m.index === inspected.index }"
+              :title="m.path"
+              @click="inspect(m)"
+            >
+              <span class="m-off">{{ m.offset < 0 ? '' : '+' + m.offset.toString(16).toUpperCase() }}</span>
+              <span class="m-name">{{ m.name }}</span>
+              <span class="m-type" :style="{ color: hue(m.type) }">{{ abbreviate(m.type) }}</span>
+            </button>
+          </div>
+          <p v-if="members.total > members.members.length" class="members-none">
+            +{{ fmt.format(members.total - members.members.length) }} more not listed
+          </p>
+        </section>
+
         <button class="scope" @click="jumpTo(inspected.path)">Scope tree to this object</button>
         <button class="scope" @click="dumpSubtree(inspected.path)">Dump tree under this object</button>
       </aside>
@@ -857,6 +941,82 @@ const mb = (n: number) => (n / 1e6).toFixed(1) + ' MB'
 }
 .link:hover {
   text-decoration: underline;
+}
+
+.members {
+  margin: 0 12px 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--rule);
+  font-size: 11px;
+}
+.members-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.members-head .link {
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.members-none {
+  color: var(--dimmer);
+  margin: 6px 0 0;
+}
+.members-label {
+  margin: 10px 0 3px;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--dimmer);
+}
+.members-label b {
+  font-weight: 400;
+  color: var(--dim);
+}
+.member {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+  padding: 3px 4px;
+  text-align: left;
+  border-radius: 2px;
+}
+.member:hover {
+  background: var(--raise);
+}
+.member.on {
+  background: var(--raise);
+  box-shadow: inset 2px 0 0 var(--amber);
+}
+.m-off {
+  flex: none;
+  width: 4ch;
+  text-align: right;
+  color: var(--dim);
+}
+.m-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-strong);
+}
+.m-type {
+  flex: none;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.members-group.dim .m-name,
+.members-group.dim .m-type {
+  color: var(--dim) !important;
 }
 
 .scope + .scope {

@@ -7,6 +7,64 @@ const SLASH = 0x2f
 /** `natural` is dump order — the order the lines appeared in the file. */
 export type SortKey = 'natural' | 'path' | 'address' | 'offset' | 'name' | 'type'
 
+/**
+ * What a row is *for*, as far as nesting and display care.
+ *
+ * `param` / `return` / `local` only apply to properties owned by a function.
+ * The dump carries no CPF_Parm flags, so they are told apart by name: native
+ * functions name their return `ReturnValue`, while Blueprint functions also
+ * own frame temporaries — `CallFunc_X_ReturnValue` holds the result of a call
+ * to X, it is *not* this function's return — prefixed as below.
+ */
+export const ROLES = [
+  'object',
+  'package',
+  'class',
+  'struct',
+  'function',
+  'member',
+  'param',
+  'return',
+  'local',
+] as const
+export type Role = (typeof ROLES)[number]
+
+const R_OBJECT = 0
+const R_PACKAGE = 1
+const R_CLASS = 2
+const R_STRUCT = 3
+const R_FUNCTION = 4
+const R_MEMBER = 5
+const R_PARAM = 6
+const R_RETURN = 7
+const R_LOCAL = 8
+
+const FUNCTION_TYPES = new Set(['Function', 'DelegateFunction', 'SparseDelegateFunction'])
+const LOCAL_PREFIXES = ['CallFunc_', 'K2Node_', 'Temp_']
+
+function typeRole(type: string): number {
+  if (type === 'Package') return R_PACKAGE
+  if (type === 'Class' || type.endsWith('GeneratedClass')) return R_CLASS
+  if (type === 'ScriptStruct' || type === 'UserDefinedStruct') return R_STRUCT
+  if (FUNCTION_TYPES.has(type)) return R_FUNCTION
+  if (type.endsWith('Property')) return R_MEMBER
+  return R_OBJECT
+}
+
+/** Ownership chains in the dump top out at 14; anything longer is a cycle. */
+const MAX_CHAIN = 64
+
+export interface Nested {
+  /** Display order: every match plus the owners that give it context. */
+  rows: Uint32Array
+  /** True nesting depth per display row. The table clamps the indent. */
+  depth: Uint8Array
+  /** 1 where the row is shown only as a match's owner, not as a match. */
+  ctx: Uint8Array
+  /** Rows that actually matched the query. */
+  matches: number
+}
+
 export interface Query {
   typeIds?: number[] // Type ids to keep. Empty/undefined = all types.
   pathPrefix?: string // Exact prefix on the object path, e.g. "/Script/Engine".
@@ -87,6 +145,114 @@ export class DumpStore {
       kind,
       // Only meaningful on enum constants; i64, so it prints rather than maths.
       value: kind === KIND_ENUM ? this.cols.value[index]! : null,
+      role: this.role(index),
+      group: this.groupOf(index),
+    }
+  }
+
+  // --- ownership
+
+  /** Row of each row's `or:`/`owr:` owner, or -1. */
+  private parent: Int32Array | null = null
+  private roles: Uint8Array | null = null
+  /** Owned rows per owner, in dump order: kidList[kidStart[r] .. kidStart[r + 1]). */
+  private kidStart: Uint32Array | null = null
+  private kidList: Uint32Array | null = null
+
+  /**
+   * One linear pass over the owner pointers. Derived rather than stored, so
+   * cached dumps and `.pdx` bundles from before this existed still load.
+   */
+  private ensureOwnership() {
+    if (this.parent) return
+    const { count, outer, typeId, types } = this.cols
+
+    const parent = new Int32Array(count).fill(-1)
+    for (let i = 0; i < count; i++) {
+      const p = this.rowByAddress(outer[i]!)
+      if (p >= 0 && p !== i) parent[i] = p
+    }
+    // UE ownership is a tree, but a damaged line or a reused address could
+    // still close a loop, and every walk below assumes one cannot happen.
+    for (let i = 0; i < count; i++) {
+      let p = parent[i]!
+      let steps = 0
+      while (p >= 0 && ++steps < MAX_CHAIN) p = parent[p]!
+      if (steps >= MAX_CHAIN) parent[i] = -1
+    }
+
+    const byType = Uint8Array.from(types, typeRole)
+    const roles = new Uint8Array(count)
+    for (let i = 0; i < count; i++) roles[i] = byType[typeId[i]!]!
+    for (let i = 0; i < count; i++) {
+      const p = parent[i]!
+      if (roles[i] !== R_MEMBER || p < 0 || roles[p] !== R_FUNCTION) continue
+      const name = this.name(i)
+      roles[i] =
+        name === 'ReturnValue'
+          ? R_RETURN
+          : LOCAL_PREFIXES.some((s) => name.startsWith(s))
+            ? R_LOCAL
+            : R_PARAM
+    }
+
+    const kidStart = new Uint32Array(count + 1)
+    for (let i = 0; i < count; i++) {
+      const p = parent[i]!
+      if (p >= 0) kidStart[p + 1] = kidStart[p + 1]! + 1
+    }
+    for (let i = 0; i < count; i++) kidStart[i + 1] = kidStart[i + 1]! + kidStart[i]!
+    const fill = kidStart.slice(0, count)
+    const kidList = new Uint32Array(kidStart[count]!)
+    for (let i = 0; i < count; i++) if (parent[i]! >= 0) kidList[fill[parent[i]!]!++] = i
+
+    this.parent = parent
+    this.roles = roles
+    this.kidStart = kidStart
+    this.kidList = kidList
+  }
+
+  role(row: number): Role {
+    this.ensureOwnership()
+    return ROLES[this.roles![row]!]!
+  }
+
+  ownerOf(row: number): number {
+    this.ensureOwnership()
+    return this.parent![row]!
+  }
+
+  /** Rows owned directly by `row`, in dump order. */
+  members(row: number): Uint32Array {
+    this.ensureOwnership()
+    return this.kidList!.subarray(this.kidStart![row]!, this.kidStart![row + 1]!)
+  }
+
+  /**
+   * Owner for display purposes. Packages are never shown as parents — they
+   * are scoped to instead — so whatever a package owns is a top-level row.
+   */
+  private nestParent(row: number): number {
+    const p = this.parent![row]!
+    return p < 0 || this.roles![p] === R_PACKAGE ? -1 : p
+  }
+
+  /**
+   * The row whose selection highlights `row` as one unit: the nearest
+   * function, class or struct at or above it, else its top-level ancestor.
+   * So a parameter groups with its function, and a class property with the
+   * class, without the class pulling every one of its functions in too.
+   */
+  groupOf(row: number): number {
+    this.ensureOwnership()
+    const roles = this.roles!
+    let r = row
+    for (;;) {
+      const role = roles[r]
+      if (role === R_FUNCTION || role === R_CLASS || role === R_STRUCT) return r
+      const p = this.nestParent(r)
+      if (p < 0) return r
+      r = p
     }
   }
 
@@ -126,7 +292,7 @@ export class DumpStore {
   // --- query
 
 
-  query(q: Query): { rows: Uint32Array; typeCounts: Int32Array } {
+  query(q: Query): Nested & { typeCounts: Int32Array } {
     const { count, typeId, types } = this.cols
     const typeCounts = new Int32Array(types.length)
 
@@ -154,26 +320,130 @@ export class DumpStore {
       out[n++] = i
     }
 
-    const rows = out.subarray(0, n)
-    return { rows: this.sort(rows, q), typeCounts }
+    return { ...this.nest(out.subarray(0, n), q), typeCounts }
   }
 
-  private sort(rows: Uint32Array, q: Query): Uint32Array {
+  /**
+   * Matches → display order.
+   *
+   * Every match pulls in its owner chain (as context rows, when the owner did
+   * not match itself), then the result is laid out depth-first. The sort is
+   * applied among siblings at every level, so a child never leaves its parent
+   * and a group's place is decided by its head alone. The one exception is a
+   * function's children, which always stay in offset order: that order *is*
+   * the params struct, and it is the reason to look at a function at all.
+   */
+  private nest(match: Uint32Array, q: Query): Nested {
+    this.ensureOwnership()
+    const { count, offset } = this.cols
+    const roles = this.roles!
+
+    // 1 = matched, 2 = owner of a match shown for context.
+    const inc = new Uint8Array(count)
+    for (let k = 0; k < match.length; k++) inc[match[k]!] = 1
+    for (let k = 0; k < match.length; k++) {
+      let p = this.nestParent(match[k]!)
+      while (p >= 0 && !inc[p]) {
+        inc[p] = 2
+        p = this.nestParent(p)
+      }
+    }
+
+    // Children per included parent, CSR over row ids. Filled in row order, so
+    // natural order needs no sort at all.
+    const start = new Uint32Array(count + 1)
+    let total = 0
+    let roots = 0
+    for (let i = 0; i < count; i++) {
+      if (!inc[i]) continue
+      total++
+      const p = this.nestParent(i)
+      if (p < 0) roots++
+      else start[p + 1] = start[p + 1]! + 1
+    }
+    for (let i = 0; i < count; i++) start[i + 1] = start[i + 1]! + start[i]!
+    const fill = start.slice(0, count)
+    const kids = new Uint32Array(start[count]!)
+    const top = new Uint32Array(roots)
+    roots = 0
+    for (let i = 0; i < count; i++) {
+      if (!inc[i]) continue
+      const p = this.nestParent(i)
+      if (p < 0) top[roots++] = i
+      else kids[fill[p]!++] = i
+    }
+
+    const cmp = this.comparator(q)
+    const byOffset = (a: number, b: number) => offset[a]! - offset[b]! || a - b
+    if (cmp) top.sort(cmp)
+    for (let p = 0; p < count; p++) {
+      const s = start[p]!
+      const e = start[p + 1]!
+      if (e - s < 2) continue
+      if (roles[p] === R_FUNCTION) kids.subarray(s, e).sort(byOffset)
+      else if (cmp) kids.subarray(s, e).sort(cmp)
+    }
+
+    // Depth-first, iteratively: chains are shallow but there are many of them.
+    const rows = new Uint32Array(total)
+    const depth = new Uint8Array(total)
+    const ctx = new Uint8Array(total)
+    const stack: number[] = []
+    const stackDepth: number[] = []
+    let n = 0
+    for (let t = 0; t < top.length; t++) {
+      stack.push(top[t]!)
+      stackDepth.push(0)
+      while (stack.length) {
+        const r = stack.pop()!
+        const d = stackDepth.pop()!
+        rows[n] = r
+        depth[n] = Math.min(d, 255)
+        ctx[n] = inc[r] === 2 ? 1 : 0
+        n++
+        for (let c = start[r + 1]! - 1; c >= start[r]!; c--) {
+          stack.push(kids[c]!)
+          stackDepth.push(d + 1)
+        }
+      }
+    }
+
+    return { rows, depth, ctx, matches: match.length }
+  }
+
+  /**
+   * Sibling comparator for the chosen column, or null when dump order stands.
+   *
+   * Rows without a value — no offset on a class or function, the null address
+   * on a recovered fragment — sort last in *both* directions. Otherwise an
+   * ascending OFF sort would hoist every group head above every member.
+   */
+  private comparator(q: Query): ((a: number, b: number) => number) | null {
     const mode = q.sort ?? 'natural'
-    if (mode === 'natural' && !q.descending) return rows
+    if (mode === 'natural' && !q.descending) return null
     const { addr, offset } = this.cols
+    const dir = q.descending ? -1 : 1
 
-    let cmp: (a: number, b: number) => number
-    if (mode === 'address') cmp = (a, b) => addr[a]! - addr[b]! || a - b
-    else if (mode === 'offset') cmp = (a, b) => offset[a]! - offset[b]! || a - b
-    else if (mode === 'path') cmp = (a, b) => this.cmpPath(a, b)
-    else if (mode === 'name') cmp = (a, b) => this.cmpName(a, b) || this.cmpPath(a, b)
-    else if (mode === 'type') cmp = (a, b) => this.cmpType(a, b) || this.cmpPath(a, b)
-    else cmp = (a, b) => a - b
+    let base: (a: number, b: number) => number
+    let missing: ((r: number) => boolean) | null = null
+    if (mode === 'address') {
+      base = (a, b) => addr[a]! - addr[b]!
+      missing = (r) => !addr[r]
+    } else if (mode === 'offset') {
+      base = (a, b) => offset[a]! - offset[b]!
+      missing = (r) => offset[r]! < 0
+    } else if (mode === 'path') base = (a, b) => this.cmpPath(a, b)
+    else if (mode === 'name') base = (a, b) => this.cmpName(a, b) || this.cmpPath(a, b)
+    else if (mode === 'type') base = (a, b) => this.cmpType(a, b) || this.cmpPath(a, b)
+    else base = (a, b) => a - b
 
-    const sorted = rows.slice().sort(cmp)
-    if (q.descending) sorted.reverse()
-    return sorted
+    if (!missing) return (a, b) => dir * base(a, b) || a - b
+    const m = missing
+    return (a, b) => {
+      const ma = m(a)
+      if (ma !== m(b)) return ma ? 1 : -1
+      return dir * base(a, b) || a - b
+    }
   }
 
   /** Byte order over the *indexable* path, so inner properties sort with their array. */

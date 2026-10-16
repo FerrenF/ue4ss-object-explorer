@@ -11,6 +11,11 @@ import { contentHash, titleFor, saveDump, loadDump } from '../lib/persist'
  */
 let store: DumpStore | null = null
 let current: Uint32Array = new Uint32Array(0)
+let currentDepth: Uint8Array = new Uint8Array(0)
+let currentCtx: Uint8Array = new Uint8Array(0)
+
+/** Classes run to hundreds of members; the inspector is not the place to read all of them. */
+const MEMBER_CAP = 400
 /** Title of the open dump, so a report can name what it was taken from. */
 let currentLabel = ''
 
@@ -30,6 +35,7 @@ type Req =
   | { id: number; op: 'window'; start: number; end: number }
   | { id: number; op: 'children'; prefix: string }
   | { id: number; op: 'resolve'; address: number }
+  | { id: number; op: 'members'; row: number }
   | { id: number; op: 'report'; prefix: string }
   | { id: number; op: 'close' }
 
@@ -100,21 +106,50 @@ async function handle(msg: Req) {
 
     case 'query': {
       const t0 = performance.now()
-      const { rows, typeCounts } = store!.query(msg.query)
+      const { rows, depth, ctx, matches, typeCounts } = store!.query(msg.query)
       current = rows
-      return { total: rows.length, typeCounts, ms: performance.now() - t0 }
+      currentDepth = depth
+      currentCtx = ctx
+      return { total: rows.length, matches, typeCounts, ms: performance.now() - t0 }
     }
 
+    // Row 0 is a real row, so positions are read straight through rather than
+    // skipping falsy ids — that skip used to shift every row after it.
     case 'window': {
       const end = Math.min(msg.end, current.length)
       const out = []
       for (let i = msg.start; i < end; i++) {
-        const el = current[i];
-        if(!el) continue
-        const row = store!.row(el)
-        if (row) out.push(row)
+        out.push({ ...store!.row(current[i]!), depth: currentDepth[i]!, ctx: !!currentCtx[i] })
       }
       return { start: msg.start, rows: out }
+    }
+
+    // What the inspector lists under an object. A parameter, return or local
+    // shows its function's signature, so the pane does not go blank when one
+    // row of the group is picked over another.
+    case 'members': {
+      const s = store!
+      let head = msg.row
+      const role = s.role(head)
+      if (role === 'param' || role === 'return' || role === 'local') head = s.ownerOf(head)
+      const headRole = head >= 0 ? s.role(head) : 'object'
+      if (headRole !== 'function' && headRole !== 'class' && headRole !== 'struct') {
+        return { head: null, members: [], total: 0 }
+      }
+      const { offset } = s.cols
+      // Offset order, which is declaration order; functions (no offset) after
+      // the properties, in dump order.
+      const ids = Array.from(s.members(head)).sort((a, b) => {
+        const oa = offset[a]!
+        const ob = offset[b]!
+        if (oa < 0 !== ob < 0) return oa < 0 ? 1 : -1
+        return oa - ob || a - b
+      })
+      return {
+        head: s.row(head),
+        members: ids.slice(0, MEMBER_CAP).map((r) => s.row(r)),
+        total: ids.length,
+      }
     }
 
     case 'children':
@@ -139,6 +174,8 @@ async function handle(msg: Req) {
     case 'close': {
       store = null
       current = new Uint32Array(0)
+      currentDepth = new Uint8Array(0)
+      currentCtx = new Uint8Array(0)
       currentLabel = ''
       return { closed: true }
     }

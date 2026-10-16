@@ -6,16 +6,33 @@ import { hue, abbreviate } from '../lib/type-hue'
 
 const props = defineProps<{
   total: number
+  /** Changes on every query, including a re-sort that leaves `total` alone. */
+  revision: number
   sharedDigits: number
   sort: SortKey
   descending: boolean
+  /** Row id (not position) of the inspected row, so it survives a re-sort. */
+  selectedIndex: number
+  selectedGroup: number
   fetchWindow: (start: number, end: number) => Promise<{ start: number; rows: RowView[] }>
 }>()
 
 const emit = defineEmits<{
   (e: 'inspect', row: RowView): void
   (e: 'sort', key: SortKey, descending: boolean): void
+  (e: 'scope', path: string): void
 }>()
+
+/**
+ * Nesting shifts the whole row right, so a nested row sits visibly askew of
+ * its parent. CONTAINER absorbs the shift, which keeps the right edge (OFF)
+ * aligned and means depth never widens the table past the room reserved for
+ * MAX_DEPTH. Beyond that the indent stops and a `+n` marker carries the rest.
+ */
+const MAX_DEPTH = 3
+const INDENT = 14
+
+const indentPx = (row: RowView | null) => Math.min(row?.depth ?? 0, MAX_DEPTH) * INDENT
 
 /**
  * Sorting is free here, and that is not obvious given the table streams its
@@ -71,7 +88,8 @@ const vars = computed(() => {
     '--w-off': w.off + 'px',
     // Header and rows both take this as a *minimum*: narrower than the
     // viewport and CONTAINER absorbs the slack, wider and the table scrolls.
-    '--row-w': sum + GAP * (COLUMNS.length - 1) + PAD * 2 + 'px',
+    // The deepest indent is reserved up front so a nested row never overhangs.
+    '--row-w': sum + GAP * (COLUMNS.length - 1) + PAD * 2 + MAX_DEPTH * INDENT + 'px',
   }
 })
 
@@ -136,7 +154,6 @@ const viewport = ref<HTMLElement | null>(null)
 const scrollTop = ref(0)
 const height = ref(600)
 const buffer = ref<{ start: number; rows: RowView[] }>({ start: 0, rows: [] })
-const selected = ref(-1)
 let generation = 0
 
 const firstVisible = computed(() => Math.max(0, Math.floor(scrollTop.value / ROW_H) - OVERSCAN))
@@ -183,14 +200,24 @@ onMounted(() => {
 })
 
 watch(
-  () => props.total,
+  () => props.revision,
   () => {
     if (viewport.value) viewport.value.scrollTop = 0
     scrollTop.value = 0
-    selected.value = -1
     refill()
   },
 )
+
+function rowClass(row: RowView | null) {
+  if (!row) return { pending: true }
+  return {
+    sel: row.index === props.selectedIndex,
+    grp: props.selectedGroup >= 0 && row.group === props.selectedGroup,
+    ctx: row.ctx,
+    local: row.role === 'local',
+    pkg: row.role === 'package',
+  }
+}
 
 const visible = computed(() => {
   const { start, rows } = buffer.value
@@ -219,6 +246,10 @@ const hex = (n: number) => n.toString(16).toUpperCase().padStart(12, '0')
 const pathPx = ref(420)
 const charPx = ref(7.2)
 const containerMax = computed(() => Math.max(8, Math.floor((pathPx.value - 2) / charPx.value)))
+
+/** An indented row's CONTAINER is narrower than the header cell it was measured from. */
+const rowContainerMax = (row: RowView) =>
+  Math.max(8, containerMax.value - Math.ceil(indentPx(row) / charPx.value))
 
 function tail(s: string, max: number) {
   return s.length <= max ? s : '…' + s.slice(s.length - max + 1)
@@ -287,10 +318,11 @@ function measureChar() {
           v-for="cell in visible"
           :key="cell.i"
           class="row mono"
-          :class="{ sel: selected === cell.i, pending: !cell.row }"
-          :style="{ top: cell.i * ROW_H + 'px' }"
-          @click="cell.row && ((selected = cell.i), emit('inspect', cell.row))"
+          :class="rowClass(cell.row)"
+          :style="{ top: cell.i * ROW_H + 'px', paddingLeft: PAD + indentPx(cell.row) + 'px' }"
+          @click="cell.row && emit('inspect', cell.row)"
         >
+          <i v-if="indentPx(cell.row)" class="indent" :style="{ width: indentPx(cell.row) + 'px' }" />
           <template v-if="cell.row">
             <span class="col-addr">
               <i class="ghost">{{ hex(cell.row.address).slice(0, sharedDigits) }}</i
@@ -304,9 +336,22 @@ function measureChar() {
               <i class="tick" :style="{ background: hue(cell.row.type) }" />
               {{ abbreviate(cell.row.type) }}
             </span>
-            <span class="col-name" :title="cell.row.name">{{ cell.row.name }}</span>
+            <span class="col-name" :title="cell.row.name">
+              <i v-if="(cell.row.depth ?? 0) > MAX_DEPTH" class="deep">+{{ cell.row.depth! - MAX_DEPTH }}</i>
+              <i v-if="cell.row.role === 'return'" class="ret" title="Return value">→</i>
+              <span class="label">{{ cell.row.name }}</span>
+              <button
+                v-if="cell.row.role === 'package'"
+                type="button"
+                class="pkg-scope"
+                title="Scope the tree to this package"
+                @click.stop="emit('scope', cell.row.path)"
+              >
+                scope
+              </button>
+            </span>
             <span class="col-path" :title="cell.row.path">{{
-              tail(cell.row.container, containerMax)
+              tail(cell.row.container, rowContainerMax(cell.row))
             }}</span>
             <span class="col-off">{{
               cell.row.offset < 0 ? '' : '0x' + cell.row.offset.toString(16).toUpperCase()
@@ -465,6 +510,36 @@ function measureChar() {
   opacity: 0.25;
 }
 
+/* The selected row's function / class group, as one unit. Under .sel so the
+   selected row itself keeps its stronger fill. */
+.row.grp {
+  background: color-mix(in srgb, var(--amber) 6%, transparent);
+}
+.row.sel {
+  background: var(--raise);
+}
+
+/* Owners pulled in so a match is not shown without its parent. */
+.row.ctx > * {
+  opacity: 0.45;
+}
+
+/* Blueprint frame temporaries: real, but rarely what you are looking for. */
+.row.local .col-name,
+.row.local .col-type {
+  color: var(--dim);
+}
+
+/* Packages are not parents in the table; they are places to scope to. */
+.row.pkg {
+  background: color-mix(in srgb, var(--t-container) 7%, transparent);
+  box-shadow: inset 2px 0 0 var(--t-container);
+}
+.row.pkg.sel {
+  background: var(--raise);
+  box-shadow: inset 2px 0 0 var(--amber);
+}
+
 /* Every width comes from the custom properties the script maintains, so a
    drag moves the header cell and all ~60 live rows in one recalculation. */
 
@@ -502,7 +577,59 @@ function measureChar() {
   flex: none;
   color: var(--ink-strong);
   overflow: hidden;
+  display: flex;
+  align-items: center;
+  align-self: stretch;
+}
+.col-name .label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* One faint guide per level in the row's indent gutter, drawn rather than
+   nested so a row costs nothing extra to render however deep it sits. */
+.indent {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 12px;
+  background: repeating-linear-gradient(
+    to right,
+    transparent 0 5px,
+    var(--rule) 5px 6px,
+    transparent 6px 14px
+  );
+}
+.deep {
+  flex: none;
+  font-style: normal;
+  font-size: 10px;
+  color: var(--dim);
+  margin-right: 5px;
+}
+.ret {
+  flex: none;
+  font-style: normal;
+  color: var(--t-callable);
+  margin-right: 5px;
+}
+
+.pkg-scope {
+  flex: none;
+  margin-left: 8px;
+  padding: 1px 6px;
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--t-container);
+  border: 1px solid color-mix(in srgb, var(--t-container) 40%, transparent);
+  border-radius: 2px;
+}
+.pkg-scope:hover {
+  border-color: var(--t-container);
+  color: var(--ink-strong);
 }
 
 /* The one column that grows: on a window wider than the columns need, the
