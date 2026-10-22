@@ -1,6 +1,6 @@
 # UE4SS Object Explorer
 
-**[u34ss-explorer.gimme.pet](https://u34ss-explorer.gimme.pet)**
+**[ue4ss-explorer.gimme.pet](https://ue4ss-explorer.gimme.pet)**
 
 A browser-based explorer for [UE4SS](https://github.com/UE4SS-RE/RE-UE4SS) `DumpObjects` output - the very large text files an Unreal Engine game emits when you ask it to enumerate every live `UObject`.
 
